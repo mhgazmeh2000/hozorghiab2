@@ -1,0 +1,116 @@
+{
+ "devices": [
+  {
+   "ip": "172.16.50.30",
+   "port": 4370,
+   "password": 0,
+   "use_udp": false,
+   "label": "",
+   "location": "",
+   "enabled": true,
+   "info": {
+    "device_name": "",
+    "serial": "AWWZ195160619",
+    "platform": "AK3750WIFI_TFT",
+    "firmware": "Ver 6.60 Sep 13 2017",
+    "mac": "00:17:61:A6:A3:69",
+    "model": "AK3750 WiFi"
+   },
+   "last_state": "offline",
+   "last_check": "2026-09-14T09:51:56",
+   "last_log_ts": "2023-12-13 16:32:11"
+  },
+  {
+   "ip": "172.16.0.20",
+   "port": 4370,
+   "password": 0,
+   "use_udp": false,
+   "label": "",
+   "location": "",
+   "enabled": true,
+   "info": {
+    "device_name": "",
+    "serial": "ADWC175060007",
+    "platform": "ZMM220_TFT",
+    "firmware": "Ver 6.60 Apr 27 2017",
+    "mac": "00:17:61:12:c9:b4",
+    "model": "ZMM220 (UF100-class)"
+   },
+   "last_state": "online",
+   "last_check": "2026-09-14T09:51:56",
+   "last_log_ts": "2026-09-14 08:33:05"
+  },
+  {
+   "ip": "172.16.32.21",
+   "port": 4370,
+   "password": 0,
+   "use_udp": false,
+   "label": "",
+   "location": "",
+   "enabled": true,
+   "info": {
+    "device_name": "MB20",
+    "serial": "2623320414184",
+    "platform": "ZLM60_TFT",
+    "firmware": "Ver 6.60 May  3 2016",
+    "mac": "00:17:61:10:51:1f",
+    "model": "MB20"
+   },
+   "last_state": "online",
+   "last_check": "2026-09-14T09:59:35",
+   "last_log_ts": "2026-09-14 08:18:42"
+  },
+  {
+   "ip": "172.16.8.20",
+   "port": 5005,
+   "password": 0,
+   "use_udp": false,
+   "label": "ai09f",
+   "location": "سروش",
+   "enabled": true,
+   "info": {},
+   "last_state": "online",
+   "last_check": "2026-09-14T09:51:56",
+   "last_log_ts": null
+  },
+  {
+   "ip": "172.16.50.68",
+   "port": 4370,
+   "password": 0,
+   "use_udp": false,
+   "label": "AK3750 WiFi",
+   "location": "",
+   "enabled": true,
+   "info": {
+    "device_name": "",
+    "serial": "AWWZ195160307",
+    "platform": "AK3750WIFI_TFT",
+    "firmware": "Ver 6.60 Sep 13 2017",
+    "mac": "00:17:61:A6:A3:69",
+    "model": "AK3750 WiFi"
+   },
+   "last_state": "online",
+   "last_check": "2026-09-14T09:52:15",
+   "last_log_ts": "2023-12-13 16:35:30"
+  }
+ ],
+ "subnets": [
+  "172.16.0.0/24",
+  "172.16.8.0/24",
+  "172.16.10.0/24",
+  "172.16.15.0/24",
+  "172.16.25.0/24",
+  "172.16.27.0/24",
+  "172.16.31.0/24",
+  "172.16.32.0/24",
+  "172.16.50.0/24",
+  "172.16.61.0/24"
+ ],
+ "auto_sync": {
+  "enabled": true,
+  "interval": 900
+ },
+ "adms_approved": [
+  "AWWZ195160307"
+ ]
+}

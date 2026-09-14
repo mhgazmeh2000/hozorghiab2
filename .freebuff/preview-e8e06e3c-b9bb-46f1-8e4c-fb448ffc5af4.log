@@ -1,0 +1,7 @@
+* Attendance manager  ->  http://0.0.0.0:5000
+* SQLite archive      ->  D:\hozor2\data\attendance.db
+* ADMS push listener  ->  port 8081 (/iclock)
+* devices registry    ->  D:\hozor2\data\devices.json
+ * Serving Flask app 'app'
+ * Debug mode: off
+[adms] listening on 0.0.0.0:8081 — set device ADMS server to 0.0.0.0:8081
