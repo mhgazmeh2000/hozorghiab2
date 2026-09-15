@@ -1,0 +1,18 @@
+# local state — never commit
+data/attendance.db
+data/attendance.db-shm
+data/attendance.db-wal
+data/gl_*.bin
+data/devices.json
+server.log
+server.err.log
+logs/
+*.log
+__pycache__/
+*.pyc
+
+# scratch work
+.tmp/
+
+# vendor installers (large, not source)
+faratecno/

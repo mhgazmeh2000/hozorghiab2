@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,8 +53,8 @@ DEFAULT_SUBNETS = [
 SEED_DEVICES = [
     {"ip": "172.16.50.30", "port": 4370, "password": 0, "use_udp": False,
      "label": "", "location": "", "enabled": True},
-    {"ip": "172.16.8.20", "port": 4370, "password": 0, "use_udp": False,
-     "label": "", "location": "", "enabled": True},
+    {"ip": "172.16.8.20", "port": 5005, "password": 0, "use_udp": False,
+     "label": "AI09F", "location": "", "enabled": True},
     {"ip": "172.16.0.20", "port": 4370, "password": 0, "use_udp": False,
      "label": "", "location": "", "enabled": True},
     {"ip": "172.16.32.21", "port": 4370, "password": 0, "use_udp": False,
@@ -216,9 +217,22 @@ def tcp_check(ip: str, port: int = 4370, timeout: float = 2.0):
         return False, None
 
 
+def icmp_check(ip: str, timeout: float = 2.0):
+    """Check host reachability when the device service port is filtered."""
+    wait_ms = max(1000, int(timeout * 1000))
+    try:
+        result = subprocess.run(
+            ["ping", "-n", "1", "-w", str(wait_ms), ip],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=timeout + 1)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _zk(dev: dict) -> ZK:
     return ZK(dev["ip"], port=int(dev.get("port", 4370)),
-              timeout=int(dev.get("timeout", 6)),
+              timeout=int(dev.get("timeout", 20)),
               password=int(dev.get("password", 0)),
               force_udp=bool(dev.get("use_udp", False)),
               ommit_ping=True)          # ICMP often blocked in tunnels
@@ -465,6 +479,10 @@ def _gl_parse_attlog(blob):
         rec = body[off:off + 22]
         uid = unpack_from("<H", rec, 0)[0]
         user_id = rec[2:6].split(b"\0")[0].decode("utf-8", "ignore")
+        # Confused-state garbage (e.g. after a clock change) has non-digit
+        # user ids and packed-time junk; real ids on these units are numeric.
+        if not user_id.isdigit():
+            continue
         try:
             ts = _gl_decode_time(unpack_from("<I", rec, 13)[0])
         except Exception:
@@ -521,7 +539,55 @@ def _gl_pull_with_fallback(conn, ip: str, kind: str, cmd, fct=0):
     raise RuntimeError("زنده خوانده نشد و نسخه ذخیره‌شده‌ای هم نیست")
 
 
-def zk_fetch_logs_greenlabel(dev: dict, conn, include_users: bool = True):
+def _gl_parse_templates(blob):
+    """Template table from 1503/FCT_FINGERTMP: records of
+    (size:u16, uid:u16, fid:i8, valid:i8, template bytes) after a 4-byte
+    total. Empty slots are zero-filled — the walker stops at the first
+    impossible record."""
+    out = []
+    body = blob[4:]
+    pos = 0
+    while pos + 6 <= len(body):
+        rsz, uid, fid, valid = unpack_from("HHbb", body, pos)
+        if 6 <= rsz <= 2200 and pos + rsz <= len(body):
+            if rsz > 6:
+                out.append({"uid": uid, "fid": fid, "valid": valid,
+                            "template": body[pos + 6:pos + rsz]})
+            pos += rsz
+            continue
+        break
+    return out
+
+
+def _gl_write_template(conn, uid, user_id, name="", privilege=0,
+                       fid=0, template=b""):
+    """Write one fingerprint template to a green-label device.
+
+    Packet layout mirrors pyzk's save_user_template() (verified live on
+    AK3750WIFI_TFT: CMD 110 answers OK and the re-read template is
+    byte-identical): head <III>(user73, table, fpack) + user73 + table +
+    fpack, then command 110 with <IHH>(12,0,8) and refresh_data()."""
+    name_b = (name or "").encode("utf-8", "ignore")[:24]
+    user73 = pack("<BHB8s24sIB7sx24s", 2, int(uid), int(privilege or 0),
+                  b"", name_b, 0, 1, b"", str(user_id).encode())
+    table = pack("<bHbI", 2, int(uid), 0x10 + int(fid), 0)
+    fpack = pack("<H%is" % len(template), len(template), template)
+    packet = pack("III", len(user73), len(table), len(fpack)) \
+        + user73 + table + fpack
+    conn._send_with_buffer(packet)
+    resp = conn._ZK__send_command(110, pack("<IHH", 12, 0, 8))
+    if not resp.get("status"):
+        raise RuntimeError(
+            f"دستگاه نوشتن قالب اثر انگشت را نپذیرفت (code {resp.get('code')})")
+    try:
+        conn.refresh_data()
+    except Exception:
+        pass
+    return True
+
+
+def zk_fetch_logs_greenlabel(dev: dict, conn, include_users: bool = True,
+                             fresh: bool = False):
     """Green-label variant of zk_fetch_logs. conn is already connected.
     Returns (records, users_count, error|None) — never raises."""
     ip = dev["ip"]
@@ -529,7 +595,7 @@ def zk_fetch_logs_greenlabel(dev: dict, conn, include_users: bool = True):
         _fp(ip, "disable", "قفل کردن صفحه دستگاه")
         conn.disable_device()
         try:
-            cached = GL_ATT_CACHE.get(ip)
+            cached = None if fresh else GL_ATT_CACHE.get(ip)
             if cached and (time.time() - cached[0]) < GL_ATT_TTL:
                 att = cached[1]
                 _fp(ip, "attlog", "خواندن از کش (۵ دقیقه‌ای)")
@@ -592,6 +658,8 @@ def zk_fetch_logs_greenlabel(dev: dict, conn, include_users: bool = True):
 # the UI can show exactly where a slow or failing pull is stuck.
 # ----------------------------------------------------------------------------
 FETCH_PROGRESS: dict = {}          # ip -> {stage, note, started, updated, ok}
+ENROLLMENTS = {}                   # ip -> active enrollment job
+ENROLLMENT_LOCK = threading.Lock()
 
 
 def _fp(ip: str, stage: str, note: str = "", ok=None):
@@ -601,9 +669,295 @@ def _fp(ip: str, stage: str, note: str = "", ok=None):
     rec.setdefault("started", now)
     if stage in ("done", "error"):
         rec["finished"] = now
+    _connection_log(ip, stage, note, ok=ok, source="fetch")
 
 
-def zk_fetch_logs(dev: dict, include_users: bool = True):
+def _enrollment_status(ip):
+    with ENROLLMENT_LOCK:
+        job = ENROLLMENTS.get(ip)
+        return dict(job) if job else None
+
+
+# ----------------------------------------------------------------------------
+# FK / "B-series" protocol (Faratechno AI09F-class face units, TCP 5005)
+#
+# The faratecno suite (LatifiWorkingTimeUIWinform + FKAttend.dll / FKViaDev.dll,
+# unpacked from faratecno/setup_NewDevice(561).exe) speaks a simple framed
+# protocol on the device's TCP 5005 listener — NOT the ZK 4370 protocol.
+# Wire format (documented by Nicola Belluti's "Attendance Reader" reverse-
+# engineering series and matching FKAttend's FK_ConnectNet device family):
+#
+#   request : 55 aa <12-byte payload> <u16le seq>          (16 bytes total)
+#   response: aa55 <8-byte header> [55 aa <payload>]
+#
+#   ping            payload 01 80 00*10  -> header-only reply 01 01 00*6
+#   record count    payload 01 b4 08 00 00 00 00 00 ff ff 00 00
+#                                        -> count in header bytes 4..5 (u16le)
+#   start dump      payload 01 a4 00 00 00 00 <count u16le> 00 00 00 04
+#   next block      payload 01 a4 00 00 00 00 00 00 <block u16le> 00 04
+#                                        -> 12-byte records until FF padding
+#   employee name   payload 01 c7 <uid u32le> 00 00 00 00 14 00
+#                                        -> payload[0:10] = 10-char name
+#   record (12B)    [? ? st ? uid u32le] [packed-time u32le]
+#                   st top bits 00/01/10/11 = in1/out1/in2/out2
+#                   packed time, big-endian view: yyyymmmmdddhhhhhmmmmmm
+#
+# dump requests carry two u16le params at offsets 6-8 / 8-10 and the flag
+# 00 04 at 10-12; responses have NO length prefix — payload (if any) is
+# read until a short quiet period. Blocks end with FF padding.
+# ----------------------------------------------------------------------------
+FK_REQ, FK_RESP = b"\x55\xaa", b"\xaa\x55"
+FK_PING = bytes.fromhex("018000000000000000000000")
+FK_COUNT = bytes.fromhex("01b4080000000000ffff0000")
+FK_DUMP_START = bytes.fromhex("01a400000000")       # + <count><0><0004>
+FK_DUMP_BLOCK = bytes.fromhex("01a4000000000000")   # + <block><0004>
+
+
+def _fk_packed_time_to_dt(t: int):
+    """FK packed date (read big-endian): 12b year, 4b month, 5b day, 5b hour,
+    6b minute. Seconds are lost in this field; records land on :00."""
+    try:
+        year = (t >> 20) & 0xFFF
+        month = (t >> 16) & 0xF
+        day = (t >> 11) & 0x1F
+        hour = (t >> 6) & 0x1F
+        minute = t & 0x3F
+        if not (2000 <= year <= 2100 and 1 <= month <= 12
+                and 1 <= day <= 31 and hour <= 23 and minute <= 59):
+            return None
+        return datetime(year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+
+def _fk_decode_record(rec: bytes):
+    """12-byte record -> (user_id, datetime, status) or None."""
+    if len(rec) != 12 or rec == b"\x00" * 12:
+        return None
+    ts_be = unpack_from(">I", rec, 8)[0]
+    dt = _fk_packed_time_to_dt(ts_be)
+    if dt is None:
+        return None
+    uid = str(unpack_from("<I", rec, 4)[0])
+    status = (rec[1] >> 6) & 0x03      # 0=in1 1=out1 2=in2 3=out2
+    return uid, dt, status
+
+
+class FKClient:
+    """Minimal FK-5005 client: count, attendance dump, employee names."""
+
+    def __init__(self, ip: str, port: int = 5005, timeout: float = 10.0):
+        self.ip, self.port, self.timeout = ip, port, timeout
+        self.sock = None
+        self.seq = 1
+
+    # -- low level ----------------------------------------------------------
+    def connect(self):
+        self.sock = socket.create_connection((self.ip, self.port),
+                                             timeout=self.timeout)
+        self.sock.settimeout(self.timeout)
+        return self
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            ch = self.sock.recv(n - len(buf))
+            if not ch:
+                raise ConnectionError("device closed connection")
+            buf += ch
+        return buf
+
+    def _recv_response(self) -> tuple:
+        """aa55 <8B header> [55aa <payload — until quiet>] -> (header, payload)"""
+        head = self._recv_exact(2)
+        if head != FK_RESP:
+            raise ConnectionError(f"bad response magic {head.hex()}")
+        header = self._recv_exact(8)
+        payload = b""
+        if self._peek_pending():
+            marker = self._recv_exact(2)
+            if marker != FK_REQ:
+                raise ConnectionError(
+                    f"bad payload marker {marker.hex()}")
+            payload = self._recv_until_quiet()
+        return header, payload
+
+    def _peek_pending(self) -> bool:
+        try:
+            self.sock.settimeout(2.5)
+            ch = self.sock.recv(2, socket.MSG_PEEK)
+            return ch == FK_REQ
+        except (socket.timeout, TimeoutError):
+            return False
+        except OSError:
+            return False
+
+    def _recv_until_quiet(self, quiet: float = 1.2,
+                          cap: int = 262144) -> bytes:
+        buf = b""
+        self.sock.settimeout(quiet)
+        try:
+            while len(buf) < cap:
+                ch = self.sock.recv(65536)
+                if not ch:
+                    break
+                buf += ch
+        except (socket.timeout, TimeoutError):
+            pass
+        return buf
+
+    def command(self, payload12: bytes) -> tuple:
+        """Send one request, return (header8, payload)."""
+        if len(payload12) != 12:
+            raise ValueError("FK payload must be 12 bytes")
+        pkt = FK_REQ + payload12 + pack("<H", self.seq & 0xFFFF)
+        self.seq += 1
+        self.sock.sendall(pkt)
+        return self._recv_response()
+
+    # -- high level ---------------------------------------------------------
+    def ping(self) -> bool:
+        header, _ = self.command(FK_PING)
+        return header[:2] == b"\x01\x01"
+
+    def get_count(self) -> int:
+        header, _ = self.command(FK_COUNT)
+        return unpack("<H", header[4:6])[0]
+
+    def get_attendance(self, include_names: bool = True):
+        """Dump all records: (records, names) — names is {uid: name}."""
+        total = self.get_count()
+        records, names = [], {}
+        payload = FK_DUMP_START + pack("<HHH", total, 0, 0x0400)
+        header, blob = self.command(payload)
+        if header[:2] != b"\x01\x01":
+            raise ConnectionError("dump refused (bad header)")
+        block = 1
+        seen_terminator = False
+        while not seen_terminator:
+            payload = FK_DUMP_BLOCK + pack("<HH", block, 0x0400)
+            try:
+                header, blob = self.command(payload)
+            except (ConnectionError, OSError):
+                break
+            if header[:2] != b"\x01\x01" or not blob:
+                break
+            for i in range(0, len(blob) - 11, 12):
+                rec = blob[i:i + 12]
+                if rec[:2] == b"\xff\xff":
+                    seen_terminator = True
+                    break
+                dec = _fk_decode_record(rec)
+                if dec:
+                    records.append(dec)
+            block += 1
+            if block > 65535:
+                break
+        # employee names — 10 chars each, one command per employee
+        if include_names:
+            for uid in {r[0] for r in records}:
+                try:
+                    ui = int(uid)
+                    if not (0 < ui < 2**32):
+                        continue
+                    payload = bytes([0x01, 0xC7]) + pack("<I", ui) + \
+                        bytes.fromhex("00000000") + pack("<H", 0x0014)
+                    header, blob = self.command(payload)
+                    if header[:2] == b"\x01\x01" and len(blob) >= 10:
+                        name = blob[:10].rstrip(b"\x00").decode(
+                            "utf-8", "ignore").strip()
+                        if name:
+                            names[uid] = name
+                except Exception:
+                    continue
+        return records, names
+
+
+def fk_fetch_logs(dev: dict, include_users: bool = True):
+    """Fetch attendance via the FK-5005 protocol. Same contract as
+    zk_fetch_logs: (records, users_count, error|None), never raises."""
+    ip = dev["ip"]
+    port = int(dev.get("port", 5005) or 5005)
+    lock = _dev_lock_for(ip)
+    _fp(ip, "lock-wait", "در انتظار آزاد شدن دستگاه…")
+    deadline = time.monotonic() + 30
+    while True:
+        if lock.acquire(blocking=False):
+            break
+        if time.monotonic() >= deadline:
+            _fp(ip, "error", "قفل دستگاه بیش از ۳۰ ثانیه آزاد نشد", ok=False)
+            return [], 0, "device busy (lock timeout after 30s)"
+        time.sleep(0.25)
+    try:
+        _fp(ip, "connect", f"اتصال FK5005 به {ip}:{port}")
+        with FKClient(ip, port, timeout=int(dev.get("timeout", 10))) as fk:
+            _fp(ip, "identify", "دستگاه FK/B-series (پروتکل 5005)")
+            if not fk.ping():
+                raise ConnectionError("FK ping بدون پاسخ")
+            _fp(ip, "attlog", "دریافت رکوردهای تردد (FK)")
+            raw_records, names = fk.get_attendance(include_names=include_users)
+            if include_users and names:
+                _users_cache[ip] = {u: n for u, n in names.items() if n}
+            recs = [{
+                "device": ip,
+                "label": dev.get("label") or "Faratechno AI09F",
+                "user_id": uid,
+                "name": names.get(uid, _users_cache.get(ip, {}).get(uid, "")),
+                "timestamp": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "punch": status,
+                "punch_label": PUNCH_LABELS.get(status, PUNCH_UNKNOWN),
+                "status": 0,
+            } for uid, dt, status in raw_records]
+            recs.sort(key=lambda r: r["timestamp"], reverse=True)
+            dev["last_state"] = "online"
+            dev["last_check"] = datetime.now().isoformat(timespec="seconds")
+            if recs:
+                dev["last_log_ts"] = recs[0]["timestamp"]
+            info = dev.get("info") or {}
+            info.setdefault("model", "Faratechno AI09F (FK/B-series)")
+            info["protocol"] = "fk5005"
+            dev["info"] = info
+            _save(DB)
+            _fp(ip, "done", f"{len(recs)} رکورد", ok=True)
+            return recs, len(names), None
+    except Exception as e:
+        dev["last_state"] = "offline"
+        dev["last_check"] = datetime.now().isoformat(timespec="seconds")
+        _save(DB)
+        failed_stage = (FETCH_PROGRESS.get(ip) or {}).get("stage", "?")
+        _fp(ip, "error", f"{type(e).__name__}: {e}", ok=False)
+        return [], 0, f"{failed_stage} → FK5005 {type(e).__name__}: {e}"
+    finally:
+        lock.release()
+
+
+def is_fk_device(dev: dict) -> bool:
+    """Devices registered with port 5005 use the FK/B-series protocol."""
+    return int(dev.get("port", 4370) or 0) == 5005
+
+
+def fetch_logs_for(dev: dict, include_users: bool = True, fresh: bool = False):
+    """Protocol dispatcher: port 5005 -> FK/B-series, else ZK/4370."""
+    if is_fk_device(dev):
+        return fk_fetch_logs(dev, include_users)
+    return zk_fetch_logs(dev, include_users, fresh)
+
+
+def zk_fetch_logs(dev: dict, include_users: bool = True, fresh: bool = False):
     """Fetch attendance records (optionally user names too).
     Never raises: returns (records, users_count, error|None).
     Progress is reported to FETCH_PROGRESS per stage."""
@@ -624,7 +978,7 @@ def zk_fetch_logs(dev: dict, include_users: bool = True):
         conn = _zk(dev).connect()
         _fp(ip, "identify", "تشخیص نوع فریم‌ور")
         if _is_green_label(conn):
-            return zk_fetch_logs_greenlabel(dev, conn, include_users)
+            return zk_fetch_logs_greenlabel(dev, conn, include_users, fresh)
         _fp(ip, "users", "دریافت لیست کاربران")
         if include_users:
             try:
@@ -670,9 +1024,10 @@ def zk_fetch_logs(dev: dict, include_users: bool = True):
                 conn.disconnect()
             except Exception:
                 pass
+        lock.release()
 
 
-def zk_set_time(dev: dict):
+def zk_set_time(dev: dict, target=None):
     """Sync the device clock. A set_time is a 0.1s command, but it shares the
     per-device lock with syncs — and a green-label sync holds that lock for
     minutes. Acquire non-blocking with a hard timeout: fail fast with a clear
@@ -690,7 +1045,7 @@ def zk_set_time(dev: dict):
     conn = None
     try:
         conn = _zk(dev).connect()
-        conn.set_time(datetime.now())
+        conn.set_time(target or datetime.now())
         return True
     finally:
         lock.release()
@@ -706,7 +1061,22 @@ def zk_set_time(dev: dict):
 # (zkteco_sync-style: pull once, store forever, query instantly)
 # ----------------------------------------------------------------------------
 SYNC_STATE = {"running": False, "last_run": None, "last_results": {},
-              "stop": False}
+              "stop": False, "cancel_requested": False,
+              "current_device": None}
+
+CONNECTION_LOG = []
+CONNECTION_LOG_LOCK = threading.Lock()
+CONNECTION_LOG_LIMIT = 2000
+
+
+def _connection_log(ip, event, detail="", ok=None, source="sync"):
+    entry = {"time": datetime.now().isoformat(timespec="seconds"),
+             "device": ip, "event": event, "detail": str(detail),
+             "ok": ok, "source": source}
+    with CONNECTION_LOG_LOCK:
+        CONNECTION_LOG.append(entry)
+        del CONNECTION_LOG[:-CONNECTION_LOG_LIMIT]
+    return entry
 
 
 def _sync_one(dev: dict) -> dict:
@@ -716,8 +1086,11 @@ def _sync_one(dev: dict) -> dict:
     the SAME session (opening a second session afterwards costs ~11s and
     risks the firmware's post-session cooldown) — so the users row-count is
     taken from the in-session fetch instead of reconnecting."""
+    ip = dev["ip"]
+    SYNC_STATE["current_device"] = ip
+    _connection_log(ip, "sync-start", "شروع همگام‌سازی")
     try:
-        recs, users_count, err = zk_fetch_logs(dev, include_users=True)
+        recs, users_count, err = fetch_logs_for(dev, include_users=True)
         new = db_save_attendance(dev["ip"], recs)
         emp = 0
         if users_count:
@@ -728,6 +1101,10 @@ def _sync_one(dev: dict) -> dict:
                         (dev["ip"],)).fetchone()[0]
             except Exception:
                 emp = users_count
+        elif is_fk_device(dev):
+            # FK devices carry no user table fetch in this flow; names were
+            # already captured by fk_fetch_logs into _users_cache.
+            emp = len(_users_cache.get(dev["ip"], {}))
         else:
             try:
                 with _dev_lock_for(dev["ip"]):
@@ -761,12 +1138,103 @@ def _sync_one(dev: dict) -> dict:
             except Exception:
                 emp = 0
         db_set_sync_state(dev["ip"], new, err or "")
+        _connection_log(ip, "sync-finished",
+                        f"تردد: {len(recs)}، رکورد جدید: {new}، کاربران: {emp}",
+                        ok=not bool(err))
+        if err:
+            _connection_log(ip, "sync-error", err, ok=False)
         return {"fetched": len(recs), "new": new, "employees": emp,
                 "error": err}
     except Exception as e:
         db_set_sync_state(dev["ip"], 0, f"{type(e).__name__}: {e}")
+        _connection_log(ip, "sync-error", f"{type(e).__name__}: {e}", ok=False)
         return {"fetched": 0, "new": 0, "employees": 0,
                 "error": f"{type(e).__name__}: {e}"}
+    finally:
+        SYNC_STATE["current_device"] = None
+
+
+def _revival_watch_loop():
+    """The green-label WiFi units accept TCP sessions only during short
+    windows (after a power cycle, or when their push client is idle).
+    Probe offline devices every minute; on the first answer, sync that
+    device immediately while the window is still open."""
+    db_init()
+    while not SYNC_STATE["stop"]:
+        time.sleep(60)
+        if not DB.get("auto_sync", {}).get("enabled", True):
+            continue
+        for d in list(DB["devices"]):
+            if SYNC_STATE["stop"] or SYNC_STATE["running"]:
+                break
+            if not d.get("enabled") or d.get("last_state") == "online":
+                continue
+            ip = d["ip"]
+            if is_fk_device(d):
+                # FK devices: a successful FK ping both proves reachability
+                # and warms up the (stateless) protocol — nothing to re-pin.
+                try:
+                    with FKClient(ip, int(d.get("port", 5005)),
+                                  timeout=3) as fk:
+                        if not fk.ping():
+                            continue
+                except Exception:
+                    continue
+                _connection_log(ip, "revival",
+                                "دستگاه FK دوباره پاسخ داد — همگام‌سازی فوری",
+                                ok=True)
+                try:
+                    _sync_one(d)
+                except Exception:
+                    pass
+                time.sleep(5)
+                continue
+            try:
+                probe = ZK(ip, port=int(d.get("port", 4370)), timeout=2,
+                           password=int(d.get("password", 0)),
+                           ommit_ping=True).connect()
+                probe.disconnect()
+            except Exception:
+                continue
+            _connection_log(ip, "revival",
+                            "دستگاه دوباره پاسخ داد — همگام‌سازی فوری",
+                            ok=True)
+            # Green-label units push to whatever ADMS server their config
+            # holds; another project may have re-pointed it (this is why .30
+            # "worked yesterday" elsewhere). While we hold a session,
+            # re-pin it to THIS server so its punches land in our archive.
+            try:
+                import socket as _s
+                lan_ip = _s.gethostbyname(_s.gethostname())
+                c2 = ZK(ip, port=int(d.get("port", 4370)), timeout=20,
+                        password=int(d.get("password", 0)),
+                        ommit_ping=True).connect()
+                try:
+                    if _is_green_label(c2):
+                        r = c2._ZK__send_command(
+                            69, ("WebServerIP=%s,WebServerPort=%d" %
+                                 (lan_ip, ADMS_PORT)).encode() + b"\x00")
+                        if r.get("status"):
+                            _connection_log(ip, "adms-repin",
+                                            "سرور Push دستگاه روی این سرور "
+                                            "تنظیم شد (%s:%s)" %
+                                            (lan_ip, ADMS_PORT), ok=True)
+                        try:
+                            c2.restart()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        c2.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                _sync_one(d)
+            except Exception:
+                pass
+            time.sleep(5)
 
 
 def _auto_sync_loop():
@@ -776,14 +1244,17 @@ def _auto_sync_loop():
         enabled = bool(DB.get("auto_sync", {}).get("enabled", True))
         if enabled and not SYNC_STATE["running"]:
             SYNC_STATE["running"] = True
+            SYNC_STATE["cancel_requested"] = False
             results = {}
             for d in list(DB["devices"]):
-                if d.get("enabled") and not SYNC_STATE["stop"]:
+                if (d.get("enabled") and not SYNC_STATE["stop"]
+                        and not SYNC_STATE["cancel_requested"]):
                     results[d["ip"]] = _sync_one(d)
             SYNC_STATE["last_results"] = results
             SYNC_STATE["last_run"] = datetime.now().isoformat(
                 timespec="seconds")
             SYNC_STATE["running"] = False
+            SYNC_STATE["cancel_requested"] = False
         for _ in range(max(60, interval)):
             if SYNC_STATE["stop"]:
                 return
@@ -803,6 +1274,8 @@ def start_background_workers():
     ADMS["approved"].update(DB.get("adms_approved", []))
     threading.Thread(target=_auto_sync_loop, daemon=True,
                      name="auto-sync").start()
+    threading.Thread(target=_revival_watch_loop, daemon=True,
+                     name="revival-watch").start()
     threading.Thread(target=_adms_listener, daemon=True,
                      name="adms").start()
 
@@ -829,6 +1302,14 @@ def _adms_log(msg):
     except UnicodeEncodeError:
         print("[adms] " + str(msg).encode("ascii", "replace").decode(),
               flush=True)
+
+
+def _adms_encode_time(dt):
+    """ZKTeco's packed clock for `SET OPTIONS DateTime=` (spec §12.5.1).
+    NOT a Unix timestamp — every month has 31 days, by design. Verified
+    against the spec's own worked example: 2018-02-22 14:54:54 = 583080894."""
+    return (((dt.year - 2000) * 12 * 31 + (dt.month - 1) * 31 + dt.day - 1)
+            * 86400 + (dt.hour * 60 + dt.minute) * 60 + dt.second)
 
 
 # zkteco_sync's pinned handshake reply (Attendance PUSH protocol).
@@ -862,6 +1343,19 @@ def _adms_queue_cmd(sn, cmd):
              "queued": datetime.now().isoformat(timespec="seconds")})
     _adms_log(f"queued C:{cid}:{cmd[:70]} for {sn}")
     return cid
+
+
+def _adms_cancel_queries(sn, table="attlog"):
+    """Remove stale query commands unsupported by Attendance PUSH units."""
+    with ADMS_LOCK:
+        st = ADMS["cmds"].get(sn)
+        if not st:
+            return 0
+        before = len(st["queue"])
+        st["queue"] = [c for c in st["queue"]
+                        if not (c.get("cmd", "").startswith("DATA QUERY")
+                                and f"tablename={table}" in c.get("cmd", ""))]
+        return before - len(st["queue"])
 
 
 def _adms_conclude(sn, cid, ret, note=""):
@@ -947,19 +1441,19 @@ def _adms_parse_users(body):
 
 
 def _adms_maybe_bootstrap(sn, ip):
-    """First handshake of an approved device with an empty employee table →
-    ask it (via the command queue) to upload its user list once."""
+    """Record the handshake without queueing unsupported pull commands.
+
+    Attendance PUSH terminals upload ATTLOG/USER through cdata themselves;
+    DATA QUERY is a Security PUSH command and can leave these units retrying.
+    """
     if sn in ADMS_BOOT:
         return
     ADMS_BOOT.add(sn)
-    try:
-        with _db() as con:
-            n = con.execute("SELECT COUNT(*) FROM employees WHERE device=?",
-                            (ip,)).fetchone()[0]
-    except Exception:
-        n = 1
-    if not n:
-        _adms_queue_cmd(sn, "DATA QUERY tablename=user,fielddesc=*,filter=*")
+    _adms_cancel_queries(sn, "user")
+    _adms_cancel_queries(sn, "attlog")
+    _connection_log(ip, "adms-handshake",
+                    "Attendance PUSH فعال؛ بدون DATA QUERY", ok=True,
+                    source="adms")
 
 
 def _adms_tabledata(ip, sn, q, body):
@@ -976,6 +1470,8 @@ def _adms_tabledata(ip, sn, q, body):
         if n:
             ADMS["events"] += n
         _adms_log(f"tabledata attlog: +{n} rows from SN={sn} ({ip})")
+        _connection_log(ip, "adms-attlog", f"دریافت {n} رکورد از Push",
+                ok=True, source="adms")
         return f"attlog={count or n}"
     _adms_log(f"tabledata {tname!r} from SN={sn} — logged and acked")
     return f"{tname}={count or 0}" if tname else "OK"
@@ -1044,39 +1540,64 @@ _DT_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 
 
 def _adms_store_events(device_ip, body):
-    """Tolerant ATTLOG line parser. Common push formats are tab-separated
-    with the user id first (or first field) and a timestamp somewhere in
-    the line; status/verify ints are best-effort."""
+    """ATTLOG line parser — zkteco_sync's positional rules first (they run in
+    production against these exact units): user_id \t timestamp \t status \t
+    punch. The tolerant timestamp-scan fallback stays for firmwares that
+    reorder fields, but position wins wherever the shape matches — the old
+    heuristic mis-read a 2-digit user id (e.g. '96') as the punch code."""
     n = 0
     with _sqlite_lock, _db() as con:
         for line in body.splitlines():
             line = line.strip()
-            if not line or line[:2] in ("C:", "S:", "O:"):
+            if not line or line[:2] in ("C:", "S:", "O:") \
+                    or line.startswith("TableName"):
                 continue
             fields = line.split("\t")
             ts = None
             ts_i = None
-            for i, f in enumerate(fields):
-                m = _DT_RE.search(f)
+            status, punch = 0, 255
+            uid = None
+            # -- positional (Attendance PUSH wire format) --------------
+            if len(fields) >= 3:
+                m = _DT_RE.fullmatch(fields[1].strip()) if len(fields) > 1 \
+                    else None
                 if m:
+                    uid = fields[0].strip()
                     ts = "%s-%s-%s %s:%s:%s" % m.groups()
-                    ts_i = i
-                    break
+                    ts_i = 1
+                    status = int(fields[2]) if fields[2].strip().isdigit() else 0
+                    if len(fields) > 3 and fields[3].strip().isdigit():
+                        punch = int(fields[3])
+            # -- tolerant fallback (unknown order) ---------------------
             if ts is None:
-                continue
-            uid = (fields[1] if ts_i == 0 else fields[0]).strip()
+                for i, f in enumerate(fields):
+                    m = _DT_RE.search(f)
+                    if m:
+                        ts = "%s-%s-%s %s:%s:%s" % m.groups()
+                        ts_i = i
+                        break
+                if ts is None:
+                    continue
+                uid = (fields[1] if ts_i == 0 else fields[0]).strip()
+                punch = 255
+                for f in fields:
+                    fs = f.strip()
+                    if fs.isdigit() and len(fs) <= 3:
+                        punch = int(fs)
+                        break
             if not uid:
                 continue
-            punch = 255
-            for f in fields:
-                fs = f.strip()
-                if fs.isdigit() and len(fs) <= 3:
-                    punch = int(fs)
-                    break
+            # Sanity window (zkteco_sync rule: never store what we cannot
+            # trust). Follow-up pushes after SET OPTIONS carry packed-time
+            # garbage like '2131-05-16' — skipped and logged, not stored.
+            if not ("2000-" <= ts[:5] <= "2099-"):
+                _adms_log(f"skipped non-ATTLOG line from {device_ip}: "
+                          f"{line[:160]!r}")
+                continue
             cur = con.execute(
                 "INSERT OR IGNORE INTO attendance(device,user_id,ts,punch,"
                 "status,source) VALUES(?,?,?,?,?,?)",
-                (device_ip, uid, ts, punch, 0, "adms"))
+                (device_ip, uid, ts, punch, status, "adms"))
             n += cur.rowcount
     return n
 
@@ -1157,6 +1678,9 @@ def _adms_handle(client, addr):
                     reply = "OK"
             elif upath.endswith("/getrequest"):
                 cmds = _adms_next_commands(sn)
+                _connection_log(ip, "adms-poll",
+                                f"polling دستگاه؛ {len(cmds)} فرمان", ok=True,
+                                source="adms")
                 reply = "\n".join(cmds) if cmds else "OK"
             elif upath.endswith("/querydata"):
                 reply = _adms_querydata(ip, sn, q, body)
@@ -1226,18 +1750,25 @@ def _scan_worker(subnets: list, timeout: float, deep: bool):
     done = 0
 
     def probe(ip):
+        # ZK clocks answer on 4370; FK/B-series (Faratechno AI09F-class)
+        # answer only on 5005. Classify by whichever port accepts TCP.
         ok, ms = tcp_check(ip, 4370, timeout)
-        return ip, ok, ms
+        if ok:
+            return ip, 4370, ms
+        ok5, ms5 = tcp_check(ip, 5005, timeout)
+        if ok5:
+            return ip, 5005, ms5
+        return ip, None, None
 
     with ThreadPoolExecutor(max_workers=512) as ex:
         futs = {ex.submit(probe, h): h for h in hosts}
         for fut in as_completed(futs):
-            ip, ok, ms = fut.result()
+            ip, port, ms = fut.result()
             done += 1
             SCAN["done"] = done
             SCAN["progress"] = f"اسکن {done}/{SCAN['total']}"
-            if ok:
-                found.append({"ip": ip, "port": 4370, "latency_ms": ms,
+            if port:
+                found.append({"ip": ip, "port": port, "latency_ms": ms,
                               "model": "", "serial": "", "platform": "",
                               "firmware": "", "known": _find_dev(ip) is not None})
 
@@ -1246,6 +1777,24 @@ def _scan_worker(subnets: list, timeout: float, deep: bool):
         known_ips = {d["ip"] for d in DB["devices"]}
 
         def deep_probe(item):
+            if item["port"] == 5005:
+                # FK device: ping + record count instead of a ZK handshake
+                try:
+                    with FKClient(item["ip"], 5005, timeout=6) as fk:
+                        if fk.ping():
+                            item.update(model="Faratechno AI09F (FK/B-series)",
+                                        platform="FK5005",
+                                        serial="")
+                            if item["ip"] in known_ips:
+                                d = _find_dev(item["ip"])
+                                if d:
+                                    item["known"] = True
+                                    d["last_state"] = "online"
+                                    d["last_check"] = datetime.now(
+                                    ).isoformat(timespec="seconds")
+                except Exception:
+                    pass
+                return item
             dev = {"ip": item["ip"], "port": 4370, "password": 0,
                    "use_udp": False, "timeout": 6, "label": "", "info": {}}
             try:
@@ -1325,6 +1874,24 @@ def api_device_add():
     return jsonify(ok=True, device=dev)
 
 
+@app.patch("/api/devices/<ip>")
+def api_device_edit(ip):
+    """Edit device metadata (label, location, enabled) without re-adding."""
+    b = request.get_json(force=True)
+    with _dev_lock:
+        dev = _find_dev(ip)
+        if not dev:
+            return jsonify(error="یافت نشد"), 404
+        if "label" in b:
+            dev["label"] = (b.get("label") or "").strip()
+        if "location" in b:
+            dev["location"] = (b.get("location") or "").strip()
+        if "enabled" in b:
+            dev["enabled"] = bool(b["enabled"])
+        _save(DB)
+    return jsonify(ok=True, device=dev)
+
+
 @app.delete("/api/devices/<ip>")
 def api_device_del(ip):
     with _dev_lock:
@@ -1341,12 +1908,14 @@ def api_device_ping(ip):
     dev = _find_dev(ip)
     if not dev:
         return jsonify(error="یافت نشد"), 404
-    ok, ms = tcp_check(dev["ip"], int(dev.get("port", 4370)),
-                       float(dev.get("timeout", 6)))
-    dev["last_state"] = "online" if ok else "offline"
+    timeout = float(dev.get("timeout", 6))
+    ok, ms = tcp_check(dev["ip"], int(dev.get("port", 4370)), timeout)
+    network_online = ok or icmp_check(dev["ip"], timeout)
+    dev["last_state"] = "online" if network_online else "offline"
     dev["last_check"] = datetime.now().isoformat(timespec="seconds")
     _save(DB)
-    return jsonify(ok=ok, latency_ms=ms, state=dev["last_state"])
+    return jsonify(ok=network_online, tcp_ok=ok, latency_ms=ms,
+                   state=dev["last_state"])
 
 
 @app.post("/api/devices/<ip>/identify")
@@ -1355,6 +1924,21 @@ def api_device_identify(ip):
     if not dev:
         return jsonify(error="یافت نشد"), 404
     try:
+        if is_fk_device(dev):
+            with FKClient(dev["ip"], int(dev.get("port", 5005)),
+                          timeout=int(dev.get("timeout", 10))) as fk:
+                if not fk.ping():
+                    raise ConnectionError("FK ping بدون پاسخ")
+                count = fk.get_count()
+            info = {"model": dev.get("label") or "Faratechno AI09F (FK/B-series)",
+                    "protocol": "fk5005",
+                    "serial": ((dev.get("info") or {}).get("serial") or "")}
+            dev["info"] = info
+            dev["last_state"] = "online"
+            dev["last_check"] = datetime.now().isoformat(timespec="seconds")
+            _save(DB)
+            info = dict(info, fk_record_count=count)
+            return jsonify(ok=True, info=info)
         info = zk_identify(dev)
         return jsonify(ok=True, info=info)
     except Exception as e:
@@ -1366,14 +1950,59 @@ def api_device_identify(ip):
 
 @app.post("/api/devices/<ip>/set_time")
 def api_device_set_time(ip):
+    """Set the device clock — zkteco_sync style (devices.py /set_time).
+
+    Two transports, chosen automatically:
+    * Push devices (green-label WiFi, ADMS-approved): the spec §12.5.1
+      command `SET OPTIONS DateTime=<packed>` is queued; the device executes
+      it on its next getrequest poll (~12 s). The interactive TCP path is
+      not available to this firmware.
+    * Everything else: live set_time over TCP, immediately verified.
+    Body (all optional): {"sync": true} (default — server time) or
+    {"dt": "YYYY-MM-DD HH:MM:SS"} for an explicit wall-clock value."""
     dev = _find_dev(ip)
     if not dev:
         return jsonify(error="یافت نشد"), 404
+    b = request.get_json(force=True, silent=True) or {}
+    if b.get("dt"):
+        try:
+            target = datetime.strptime(str(b["dt"]).strip(),
+                                       "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return jsonify(error="قالب زمان باید YYYY-MM-DD HH:MM:SS باشد"), 400
+    else:
+        target = datetime.now()
+    info = dev.get("info") or {}
+    is_push = ("AK3750" in (info.get("platform") or "").upper()
+               or (info.get("serial") or "").upper().startswith("AW"))
+    sn = ((info.get("serial") or "").strip()) if is_push else ""
+    # Direct TCP works on every model incl. green-label (verified live:
+    # the firmware rejects interactive ENROLL over TCP but accepts the
+    # plain time-write). ADMS `SET OPTIONS DateTime=` is the fallback for
+    # when the device is mid-sync / in its session cooldown.
+    if is_fk_device(dev):
+        return jsonify(ok=False,
+                       error="تنظیم ساعت از راه دور برای دستگاه‌های FK "
+                             "پشتیبانی نمی‌شود؛ از منوی خود دستگاه استفاده کنید"), 501
     try:
-        zk_set_time(dev)
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 502
+        zk_set_time(dev, target)
+        _connection_log(ip, "set-time",
+                        "ساعت از راه TCP تنظیم شد", ok=True, source="sdk")
+        return jsonify(ok=True, transport="tcp",
+                       time_set=target.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as tcp_err:
+        if sn and sn in ADMS["approved"]:
+            cid = _adms_queue_cmd(
+                sn, "SET OPTIONS DateTime=%d" % _adms_encode_time(target))
+            _connection_log(ip, "set-time",
+                            f"TCP ناموفق ({type(tcp_err).__name__})؛ فرمان "
+                            f"تنظیم ساعت C:{cid} در صف Push گذاشته شد",
+                            ok=None, source="adms")
+            return jsonify(ok=True, queued=True, cmd_id=cid, sn=sn,
+                           time_set=target.strftime("%Y-%m-%d %H:%M:%S"),
+                           note="دستگاه در اولین polling (حدود ۱۲ ثانیه) "
+                                "ساعت را اعمال می‌کند")
+        return jsonify(ok=False, error=str(tcp_err)), 502
 
 
 @app.post("/api/devices/<ip>/restart")
@@ -1381,6 +2010,10 @@ def api_device_restart(ip):
     dev = _find_dev(ip)
     if not dev:
         return jsonify(error="یافت نشد"), 404
+    if is_fk_device(dev):
+        return jsonify(ok=False,
+                       error="ری‌استارت از راه دور برای دستگاه‌های FK پشتیبانی "
+                             "نمی‌شود؛ از منوی خود دستگاه استفاده کنید"), 501
     try:
         with _dev_lock_for(ip):
             conn = _zk(dev).connect()
@@ -1396,6 +2029,18 @@ def api_device_users(ip):
     if not dev:
         return jsonify(error="یافت نشد"), 404
     try:
+        if is_fk_device(dev):
+            # FK/B-series: there is no separate user-table command; names
+            # ride along with the attendance dump (one 01c7 per employee).
+            recs, _n, err = fk_fetch_logs(dev, include_users=True)
+            if err and not recs:
+                return jsonify(ok=False, error=err), 502
+            names = _users_cache.get(ip, {})
+            users = [{"uid": i, "user_id": uid, "name": names.get(uid, ""),
+                      "privilege": 0, "card": "0"}
+                     for i, uid in enumerate(sorted({r["user_id"] for r in recs},
+                                                    key=lambda x: (len(x), x)))]
+            return jsonify(ok=True, users=users)
         with _dev_lock_for(ip):
             conn = _zk(dev).connect()
             try:
@@ -1426,11 +2071,212 @@ def api_device_users(ip):
         return jsonify(ok=False, error=str(e)), 502
 
 
+@app.get("/api/users")
+def api_users():
+    ip = request.args.get("device", "all")
+    with _sqlite_lock, _db() as con:
+        if ip == "all":
+            rows = con.execute(
+                "SELECT device,user_id,name,privilege,card,updated FROM employees "
+                "ORDER BY device,user_id").fetchall()
+        else:
+            rows = con.execute(
+                "SELECT device,user_id,name,privilege,card,updated FROM employees "
+                "WHERE device=? ORDER BY user_id", (ip,)).fetchall()
+    return jsonify(ok=True, users=[{"device": r[0], "user_id": r[1],
+        "name": r[2], "privilege": r[3], "card": r[4], "updated": r[5]}
+        for r in rows])
+
+
+@app.post("/api/devices/<ip>/users")
+def api_user_create(ip):
+    dev = _find_dev(ip)
+    if not dev:
+        return jsonify(error="یافت نشد"), 404
+    b = request.get_json(force=True, silent=True) or {}
+    user_id = str(b.get("user_id") or "").strip()
+    name = str(b.get("name") or "").strip()
+    if not user_id or not name:
+        return jsonify(error="شناسه و نام کاربر الزامی است"), 400
+    try:
+        uid = int(b.get("uid") or user_id)
+        privilege = 14 if bool(b.get("admin")) else 0
+        lock = _dev_lock_for(ip)
+        lock.acquire()
+        conn = None
+        try:
+            conn = _zk(dev).connect()
+            try:
+                conn.set_user(uid=uid, name=name, privilege=privilege,
+                              password=str(b.get("password") or ""),
+                              group_id="0", user_id=user_id,
+                              card=int(b.get("card") or 0))
+            finally:
+                if conn is not None:
+                    conn.disconnect()
+        finally:
+            lock.release()
+        db_save_users(ip, [{"user_id": user_id, "name": name,
+                            "privilege": privilege, "card": b.get("card") or 0,
+                            "uid": uid}])
+        return jsonify(ok=True, user={"device": ip, "uid": uid,
+                       "user_id": user_id, "name": name})
+    except Exception as e:
+        return jsonify(ok=False, error=f"{type(e).__name__}: {e}"), 502
+
+
+@app.get("/api/devices/<ip>/enroll")
+def api_enroll_status(ip):
+    return jsonify(ok=True, enrollment=_enrollment_status(ip))
+
+
+@app.post("/api/devices/<ip>/enroll")
+def api_enroll_start(ip):
+    dev = _find_dev(ip)
+    if not dev:
+        return jsonify(error="یافت نشد"), 404
+    b = request.get_json(force=True, silent=True) or {}
+    user_id = str(b.get("user_id") or "").strip()
+    uid = int(b.get("uid") or user_id or 0)
+    if not user_id:
+        return jsonify(error="شناسه کاربر الزامی است"), 400
+    source_ip = (b.get("source") or "").strip()
+    with ENROLLMENT_LOCK:
+        if ENROLLMENTS.get(ip, {}).get("running"):
+            return jsonify(error="ثبت اثر انگشت این دستگاه در حال اجراست"), 409
+        ENROLLMENTS[ip] = {"running": True, "stage": "starting",
+                           "user_id": user_id, "uid": uid,
+                           "source": source_ip,
+                           "started": datetime.now().isoformat(timespec="seconds"),
+                           "message": "در حال اتصال؛ منتظر بمانید"}
+
+    def worker():
+        conn = None
+        try:
+            lock = _dev_lock_for(ip)
+            with lock:
+                conn = _zk(dev).connect()
+                if _is_green_label(conn):
+                    # Green-label firmware rejects interactive enrollment
+                    # (CMD 61 -> NAK, verified live) but ACCEPTS template
+                    # writes (CMD 110, verified byte-identical round-trip).
+                    # So: copy the fingerprint from a normal device.
+                    if not source_ip or source_ip == ip:
+                        with ENROLLMENT_LOCK:
+                            ENROLLMENTS[ip].update(
+                                running=False, stage="need-source", ok=False,
+                                message=(
+                                    "این دستگاه (Green Label) ثبت تعاملی با "
+                                    "حسگر را از راه دور قبول نمی‌کند. انگشت را "
+                                    "روی یک دستگاه دیگر (مثلاً UF100) ثبت کنید "
+                                    "و «دستگاه مبدأ» را انتخاب کنید؛ قالب اثر "
+                                    "انگشت به‌صورت خودکار کپی می‌شود."),
+                                finished=datetime.now().isoformat(
+                                    timespec="seconds"))
+                        return
+                    with ENROLLMENT_LOCK:
+                        ENROLLMENTS[ip].update(
+                            stage="copy-read",
+                            message=(f"خواندن اثر انگشت کاربر از {source_ip}…"))
+                    sdev = _find_dev(source_ip)
+                    if not sdev:
+                        raise RuntimeError("دستگاه مبدأ یافت نشد")
+                    sconn = None
+                    slock = _dev_lock_for(source_ip)
+                    with slock:
+                        try:
+                            sconn = _zk(sdev).connect()
+                            if _is_green_label(sconn):
+                                raise RuntimeError(
+                                    "دستگاه مبدأ هم Green Label است؛ کپی فقط "
+                                    "از یک دستگاه معمولی (UF100/MB20) کار می‌کند")
+                            fing = sconn.get_user_template(uid=int(uid),
+                                                           temp_id=int(
+                                                               b.get("finger") or 0),
+                                                           user_id=user_id)
+                            if not fing:
+                                raise RuntimeError(
+                                    "کاربر در دستگاه مبدأ اثر انگشت ثبت‌شده "
+                                    "ندارد؛ اول روی دستگاه مبدأ ثبت کنید")
+                            tpl = fing.template
+                            sfid = int(fing.fid)
+                        finally:
+                            if sconn is not None:
+                                try:
+                                    sconn.disconnect()
+                                except Exception:
+                                    pass
+                    with ENROLLMENT_LOCK:
+                        ENROLLMENTS[ip].update(
+                            stage="copy-write",
+                            message=(f"نوشتن قالب ({len(tpl)} بایت) روی {ip}…"))
+                    _gl_write_template(conn, uid, user_id,
+                                       name=str(b.get("name") or ""),
+                                       privilege=int(b.get("privilege") or 0),
+                                       fid=sfid, template=tpl)
+                    with ENROLLMENT_LOCK:
+                        ENROLLMENTS[ip].update(
+                            running=False, stage="done", ok=True,
+                            message=("قالب اثر انگشت با موفقیت کپی شد"),
+                            finished=datetime.now().isoformat(
+                                timespec="seconds"))
+                    return
+                with ENROLLMENT_LOCK:
+                    ENROLLMENTS[ip].update(stage="waiting", message=(
+                        "انگشت را روی دستگاه بگذارید؛ ثبت معمولاً سه بار انجام می‌شود"))
+                ok = conn.enroll_user(uid=uid, temp_id=0, user_id=user_id)
+            with ENROLLMENT_LOCK:
+                ENROLLMENTS[ip].update(running=False, stage="done", ok=bool(ok),
+                                       message="ثبت اثر انگشت موفق بود" if ok else
+                                       "دستگاه ثبت اثر انگشت را تأیید نکرد",
+                                       finished=datetime.now().isoformat(timespec="seconds"))
+        except Exception as e:
+            with ENROLLMENT_LOCK:
+                ENROLLMENTS[ip].update(running=False, stage="error", ok=False,
+                    message=f"{type(e).__name__}: {e}",
+                    finished=datetime.now().isoformat(timespec="seconds"))
+        finally:
+            if conn is not None:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+    threading.Thread(target=worker, daemon=True,
+                     name=f"enroll-{ip}").start()
+    return jsonify(ok=True, started=True, enrollment=_enrollment_status(ip))
+
+
+@app.post("/api/devices/<ip>/enroll/cancel")
+def api_enroll_cancel(ip):
+    # pyzk's enroll_user owns the protocol exchange; cancellation is exposed
+    # as an operator state and the worker releases the device lock on return.
+    with ENROLLMENT_LOCK:
+        job = ENROLLMENTS.get(ip)
+        if not job or not job.get("running"):
+            return jsonify(ok=True, cancelled=False, message="ثبت فعالی وجود ندارد")
+        job.update(cancel_requested=True, message="لغو درخواست شد؛ در حال پایان ارتباط")
+    return jsonify(ok=True, cancelled=True)
+
+
 # ---------------- logs ----------------
 @app.get("/api/fetch-progress")
 def api_fetch_progress():
     """Live stage/progress of the last/current logs fetch per device."""
     return jsonify(ok=True, progress=FETCH_PROGRESS)
+
+
+@app.get("/api/connection-logs")
+def api_connection_logs():
+    ip = request.args.get("device", "all").strip()
+    limit = min(max(int(request.args.get("limit", 500)), 1),
+                CONNECTION_LOG_LIMIT)
+    with CONNECTION_LOG_LOCK:
+        rows = list(CONNECTION_LOG)
+    if ip != "all":
+        rows = [row for row in rows if row["device"] == ip]
+    return jsonify(ok=True, logs=rows[-limit:][::-1],
+                   total=len(rows), devices=[d["ip"] for d in DB["devices"]])
 
 
 @app.get("/api/logs")
@@ -1454,7 +2300,7 @@ def api_logs():
                 target["timeout"] = max(2, min(120, int(float(timeout))))
             except ValueError:
                 pass
-        return target, zk_fetch_logs(target)
+        return target, fetch_logs_for(target)
 
     all_recs, errors = [], {}
     if len(targets) > 1:
@@ -1523,6 +2369,71 @@ def api_logs():
     return jsonify(ok=True, total=len(all_recs), shown=min(limit, len(all_recs)),
                    records=all_recs[:limit], errors=errors,
                    from_archive=from_archive)
+
+
+@app.get("/api/logs/new")
+def api_new_logs():
+    """Fetch live records and return only keys absent from the local archive."""
+    ip = request.args.get("device", "all")
+    d_from, d_to = request.args.get("from"), request.args.get("to")
+    limit = min(int(request.args.get("limit", 5000)), 100000)
+    targets = [d for d in DB["devices"] if d.get("enabled")] if ip == "all" \
+        else [d for d in DB["devices"] if d["ip"] == ip]
+    if ip != "all" and not targets:
+        return jsonify(error="یافت نشد"), 404
+    # Green-label WiFi units can take minutes to stream their whole ATTLOG.
+    # Use their ADMS polling channel instead so the request returns immediately.
+    if len(targets) == 1:
+        device = targets[0]
+        serial = ((device.get("info") or {}).get("serial") or "").strip()
+        platform = ((device.get("info") or {}).get("platform") or "").upper()
+        if serial and (serial.upper().startswith("AW") or
+                       "AK3750" in platform):
+            cancelled = _adms_cancel_queries(serial, "attlog")
+            ADMS["approved"].add(serial)
+            with _dev_lock:
+                DB["adms_approved"] = sorted(ADMS["approved"])
+                _save(DB)
+            _connection_log(device["ip"], "adms-push-request",
+                            f"Realtime فعال است؛ {cancelled} فرمان قدیمی حذف شد",
+                            ok=True, source="adms")
+            _connection_log(device["ip"], "adms-query-queued",
+                            "منتظر polling و ارسال ATTLOG از دستگاه",
+                            source="adms")
+            return jsonify(ok=True, pending=True, cmd_id=None,
+                           serial=serial, total=0, shown=0, records=[],
+                           errors={}, note=(
+                               "درخواست ارسال شد؛ دستگاه در polling بعدی "
+                               "ترددهای جدید را به سرور ارسال می‌کند"))
+    all_recs, errors = [], {}
+    for dev in targets:
+        target = dict(dev)
+        try:
+            if request.args.get("timeout"):
+                target["timeout"] = max(2, min(120, int(float(
+                    request.args["timeout"]))))
+        except ValueError:
+            pass
+        recs, _, err = fetch_logs_for(target, include_users=True, fresh=True)
+        if err:
+            errors[target["ip"]] = err
+        all_recs.extend(recs)
+    if d_from:
+        all_recs = [r for r in all_recs if r["timestamp"] >= d_from + " 00:00:00"]
+    if d_to:
+        all_recs = [r for r in all_recs if r["timestamp"] <= d_to + " 23:59:59"]
+    keys = [(r["device"], r["user_id"], r["timestamp"], r.get("punch"))
+            for r in all_recs]
+    with _sqlite_lock, _db() as con:
+        existing = set(con.execute(
+            "SELECT device,user_id,ts,punch FROM attendance WHERE device IN "
+            f"({','.join('?' for _ in targets)})",
+            [d["ip"] for d in targets]).fetchall()) if targets else set()
+    new_recs = [r for r, key in zip(all_recs, keys) if key not in existing]
+    new_recs.sort(key=lambda r: r["timestamp"], reverse=True)
+    return jsonify(ok=True, total=len(new_recs), shown=min(limit, len(new_recs)),
+                   records=new_recs[:limit], errors=errors,
+                   note="رکوردها فقط نمایش داده شدند و هنوز در بایگانی ذخیره نشده‌اند")
 
 
 # ---------------- archive / auto-sync / ADMS ----------------
@@ -1597,15 +2508,29 @@ def api_sync_now():
 
     def run():
         SYNC_STATE["running"] = True
+        SYNC_STATE["cancel_requested"] = False
         results = {}
         for d in targets:
+            if SYNC_STATE["cancel_requested"]:
+                break
             results[d["ip"]] = _sync_one(d)
         SYNC_STATE["last_results"] = results
         SYNC_STATE["last_run"] = datetime.now().isoformat(timespec="seconds")
         SYNC_STATE["running"] = False
+        SYNC_STATE["cancel_requested"] = False
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify(ok=True, started=True, devices=[d["ip"] for d in targets])
+
+
+@app.post("/api/sync/stop")
+def api_sync_stop():
+    if not SYNC_STATE["running"]:
+        return jsonify(ok=True, stopped=False, message="همگام‌سازی فعالی وجود ندارد")
+    SYNC_STATE["cancel_requested"] = True
+    _connection_log(SYNC_STATE.get("current_device") or "all", "sync-stop",
+                    "درخواست توقف توسط کاربر", ok=None, source="user")
+    return jsonify(ok=True, stopped=True, message="توقف پس از پایان دستگاه جاری انجام می‌شود")
 
 
 @app.get("/api/sync")
@@ -1669,18 +2594,36 @@ def _adms_sn_for_ip(ip):
     return ((d or {}).get("info") or {}).get("serial") or ""
 
 
+def _adms_device_for_key(key):
+    """Resolve an ADMS query target sent as either IP or serial number."""
+    key = (key or "").strip()
+    device = _find_dev(key)
+    if device:
+        return device
+    return next((d for d in DB["devices"]
+                 if ((d.get("info") or {}).get("serial") or "").strip() == key),
+                None)
+
+
 @app.post("/api/adms/query")
 def api_adms_query():
-    """Queue a DATA QUERY for a device (the zkteco_sync pull-over-push path):
-    the device uploads users/attendance to /iclock/querydata on its next poll."""
+    """Request a push refresh; Attendance PUSH devices are not queried."""
     b = request.get_json(force=True, silent=True) or {}
-    ip = (b.get("device") or "").strip()
+    device_key = (b.get("device") or "").strip()
     table = (b.get("table") or "attlog").strip().lower()
     if table not in ("attlog", "user"):
         return jsonify(error="table باید attlog یا user باشد"), 400
-    sn = _adms_sn_for_ip(ip)
+    dev = _adms_device_for_key(device_key)
+    sn = ((dev or {}).get("info") or {}).get("serial") or ""
     if not sn:
         return jsonify(error="سریال دستگاه یافت نشد — ابتدا identify کنید"), 400
+    if table == "attlog" and (sn.upper().startswith("AW") or
+                               "AK3750" in ((dev.get("info") or {}).get(
+                                   "platform") or "").upper()):
+        cancelled = _adms_cancel_queries(sn, table)
+        return jsonify(ok=True, sn=sn, pending=True, cmd_id=None,
+                       cancelled=cancelled,
+                       note="Realtime فعال است؛ منتظر ارسال ATTLOG دستگاه باشید")
     if sn not in ADMS["approved"]:
         ADMS["approved"].add(sn)
         with _dev_lock:
@@ -1902,6 +2845,7 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
   <h1>🖥 سامانه حضور و غیاب</h1>
   <span class="badge" id="clock"></span>
   <span style="flex:1"></span>
+    <button class="btn d" id="stop-sync-btn" onclick="stopSync()">توقف همگام‌سازی</button>
   <button class="btn p" onclick="checkAll()">بررسی اتصال همه</button>
   <button class="btn" onclick="loadDevices(true)">↻</button>
 </header>
@@ -1910,9 +2854,11 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
 <div class="tabs">
   <button class="on" data-t="dash" onclick="tab('dash',this)">داشبورد</button>
   <button data-t="devs" onclick="tab('devs',this)">دستگاه‌ها</button>
+    <button data-t="users" onclick="tab('users',this)">کاربران</button>
   <button data-t="logs" onclick="tab('logs',this)">ترددها</button>
   <button data-t="arch" onclick="tab('arch',this)">بایگانی</button>
   <button data-t="sync" onclick="tab('sync',this)">همگام‌سازی</button>
+    <button data-t="conn" onclick="tab('conn',this)">لاگ ارتباط</button>
   <button data-t="scan" onclick="tab('scan',this)">اسکن شبکه</button>
 </div>
 
@@ -1921,6 +2867,28 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
   <div class="card"><div class="grid" id="kpis"></div></div>
   <div class="card"><h2>وضعیت سریع دستگاه‌ها</h2>
     <div style="overflow:auto"><table id="dash-tbl"></table></div></div>
+</section>
+
+<!-- ============ USERS ============ -->
+<section id="t-users" style="display:none">
+    <div class="card"><h2>مدیریت کاربران</h2>
+        <div class="row">
+            <div><label>دستگاه</label><select id="u-dev" onchange="loadUsers()"></select></div>
+            <div><label>فیلتر دستگاه</label><input id="u-filter" placeholder="IP یا مدل" oninput="filterUserDevices()" style="direction:ltr"></div>
+            <div><label>شناسه کاربر</label><input id="u-id" style="direction:ltr"></div>
+            <div><label>UID عددی</label><input id="u-uid" style="direction:ltr"></div>
+            <div><label>نام و نام خانوادگی</label><input id="u-name"></div>
+            <div><label>شماره کارت اختیاری</label><input id="u-card" style="direction:ltr"></div>
+            <div><label>&nbsp;</label><button class="btn p" onclick="createUser()">ساخت کاربر روی دستگاه</button></div>
+        </div>
+        <div class="row">
+            <div><label>دستگاه مبدأ برای کپی اثر انگشت (اختیاری)</label><select id="u-src"></select></div>
+            <div style="flex:2"><label>&nbsp;</label><div class="mut">دستگاه‌های Green Label (مثل WL50) ثبت تعاملی با حسگر را از راه دور قبول نمی‌کنند؛ اثر انگشت را روی دستگاه مبدأ ثبت کنید و از آنجا کپی شود. اگر خالی بماند، ثبت مستقیم روی خود دستگاه انجام می‌شود.</div></div>
+        </div>
+        <div class="mut" style="margin-top:8px">پس از ساخت کاربر، برای ثبت اثر انگشت همان ردیف روی «شروع ثبت اثر انگشت» بزنید و شخص سه بار انگشت خود را روی دستگاه قرار دهد.</div>
+        <div id="u-sum" class="mut" style="margin-top:8px"></div>
+    </div>
+    <div class="card"><div style="overflow:auto"><table id="users-tbl"></table></div></div>
 </section>
 
 <!-- ============ DEVICES ============ -->
@@ -1953,6 +2921,8 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
       <div><label>تایم‌اوت (ثانیه)</label><input id="q-timeout" value="10" style="direction:ltr;width:80px"
              title="حداکثر انتظار برای هر بسته شبکه — برای دستگاه‌های WiFi کندتر، بالاتر بگذارید"></div>
       <div style="flex:0"><label>&nbsp;</label><button class="btn p" onclick="fetchLogs()">استعلام</button></div>
+          <div style="flex:0"><label>&nbsp;</label><button class="btn" onclick="fetchArchivedLogs()">نمایش فوری بایگانی</button></div>
+    <div style="flex:0"><label>&nbsp;</label><button class="btn" onclick="fetchNewLogs()">بررسی رکوردهای جدید</button></div>
       <div style="flex:0"><label>&nbsp;</label><button class="btn" onclick="exportData('csv')">خروجی CSV</button></div>
       <div style="flex:0"><label>&nbsp;</label><button class="btn" onclick="exportData('xlsx')">خروجی Excel</button></div>
     </div>
@@ -1997,6 +2967,19 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
     <div style="overflow:auto"><table id="adms-tbl"></table></div>
     <div class="mut" style="margin-top:6px">استعلام از طریق پروتکل PUSH (الگوی zkteco_sync): دستور DATA QUERY در صف قرار می‌گیرد و دستگاه در اولین polling، داده را به سرور push می‌کند.</div>
   </div>
+</section>
+
+<!-- ============ CONNECTION LOG ============ -->
+<section id="t-conn" style="display:none">
+    <div class="card"><h2>لاگ ارتباط و خطاهای دستگاه‌ها</h2>
+        <div class="row">
+            <div><label>دستگاه</label><select id="c-dev"></select></div>
+            <div style="flex:0"><label>&nbsp;</label><button class="btn p" onclick="loadConnectionLogs()">به‌روزرسانی</button></div>
+            <div style="flex:0"><label>&nbsp;</label><button class="btn" onclick="clearConnectionTable()">پاک‌کردن نمایش</button></div>
+        </div>
+        <div id="c-sum" class="mut" style="margin-top:8px"></div>
+    </div>
+    <div class="card"><div style="overflow:auto;max-height:65vh"><table id="conn-tbl"></table></div></div>
 </section>
 
 <!-- ============ SCAN ============ -->
@@ -2068,11 +3051,13 @@ async function api(url,opt){
  }}
 
 function tab(id,btn){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
- btn.classList.add('on');['dash','devs','logs','arch','sync','scan'].forEach(t=>
+ btn.classList.add('on');['dash','devs','users','logs','arch','sync','conn','scan'].forEach(t=>
  $('#t-'+t).style.display=t===id?'':'none');
+ if(id==='users'){fillUserDeviceSelect();loadUsers();}
  if(id==='logs')fillDevSelect();
  if(id==='arch')fillArchSelect();
- if(id==='sync')loadSync();}
+ if(id==='sync')loadSync();
+ if(id==='conn'){fillConnectionSelect();loadConnectionLogs();}}
 
 /* ---------- dashboard ---------- */
 async function loadDevices(){try{
@@ -2112,6 +3097,7 @@ function renderDevs(){
      `<button class="btn" onclick="quickLogs('${d.ip}')">ترددها</button>`+
      `<button class="btn" onclick="showUsers('${d.ip}')">کاربران</button>`+
      `<button class="btn" onclick="syncTime('${d.ip}')">همگام‌سازی ساعت</button>`+
+     `<button class="btn" onclick="syncTimeCustom('${d.ip}')">تنظیم دلخواه ساعت</button>`+
      `<button class="btn" onclick="reboot('${d.ip}')">ری‌استارت</button>`+
      `<button class="btn d" onclick="delDevice('${d.ip}')">حذف</button>`+
      `</div></td></tr>`;}
@@ -2135,8 +3121,26 @@ async function addDevice(){const ip=$('#n-ip').value.trim();
     location:$('#n-loc').value.trim()})});
   toast('دستگاه اضافه شد');$('#n-ip').value='';$('#n-serial').value='';loadDevices();identifyOne(ip);}
  catch(e){toast(e.message,1)}}
-async function syncTime(ip){try{await api('/api/devices/'+ip+'/set_time',{method:'POST'});
- toast('ساعت دستگاه همگام شد');}catch(e){toast(e.message,1)}}
+function nowStr(){const d=new Date();const p=n=>String(n).padStart(2,'0');
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+
+  p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
+async function syncTime(ip){try{const j=await api('/api/devices/'+encodeURIComponent(ip)+'/set_time',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({sync:true})});
+  toast(j.queued?
+   ('فرمان تنظیم ساعت ('+(j.time_set||'')+') در صف Push قرار گرفت — دستگاه حدود ۱۲ ثانیه دیگر اعمال می‌کند'):
+   ('✅ ساعت دستگاه روی زمان سرور تنظیم شد'));
+ }catch(e){toast(e.message,1)}}
+async function syncTimeCustom(ip){
+ const dt=prompt('زمان دلخواه دستگاه (YYYY-MM-DD HH:MM:SS):', nowStr());
+ if(dt===null)return;
+ const v=dt.trim();
+ if(!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)){toast('قالب درست نیست — نمونه: 2026-09-14 08:00:00',1);return}
+ try{const j=await api('/api/devices/'+encodeURIComponent(ip)+'/set_time',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({dt:v})});
+  toast(j.queued?
+   ('فرمان تنظیم ساعت ('+(j.time_set||'')+') در صف Push قرار گرفت — دستگاه حدود ۱۲ ثانیه دیگر اعمال می‌کند'):
+   ('✅ ساعت دستگاه روی '+v+' تنظیم شد'));
+ }catch(e){toast(e.message,1)}}
 async function reboot(ip){if(!confirm('ری‌استارت '+ip+'؟'))return;
  try{await api('/api/devices/'+ip+'/restart',{method:'POST'});toast('دستگاه در حال راه‌اندازی مجدد');}
  catch(e){toast(e.message,1)}}
@@ -2154,6 +3158,53 @@ function fillDevSelect(){const s=$('#q-dev'),v=s.value;
  s.innerHTML='<option value="all">همه دستگاه‌ها</option>'+
   DEVS.map(d=>`<option value="${d.ip}">${esc(d.ip)} ${esc(d.label||d.info?.model||'')}</option>`).join('');
  if(v)s.value=v;}
+function fillUserDeviceSelect(){filterUserDevices();
+ const s=$('#u-src'),cv=s.value;
+ s.innerHTML='<option value="">— بدون مبدأ (ثبت مستقیم) —</option>'+
+  DEVS.map(d=>`<option value="${d.ip}">${esc(d.ip)} ${esc(d.label||d.info?.model||'')}</option>`).join('');
+ if(cv)s.value=cv;}
+function filterUserDevices(){const s=$('#u-dev'),current=s.value||'all',term=($('#u-filter').value||'').trim().toLowerCase();
+ const matches=d=>!term||`${d.ip} ${d.label||''} ${d.info?.model||''}`.toLowerCase().includes(term);
+ const options=DEVS.filter(matches).map(d=>`<option value="${d.ip}">${esc(d.ip)} ${esc(d.label||d.info?.model||'')}</option>`).join('');
+ s.innerHTML='<option value="all">همه دستگاه‌ها</option>'+options;
+ s.value=(current==='all'||DEVS.some(d=>d.ip===current&&matches(d)))?current:'all';
+ loadUsers();}
+async function loadUsers(){try{
+ const j=await api('/api/users?device='+encodeURIComponent($('#u-dev').value||'all'));
+ $('#u-sum').textContent=`${j.users.length} کاربر در سامانه`;
+ let h='<tr><th>دستگاه</th><th>شناسه</th><th>نام</th><th>کارت</th><th>آخرین تغییر</th><th>عملیات</th></tr>';
+ for(const u of j.users)h+=`<tr><td class="ltr">${esc(u.device)}</td>`+
+  `<td class="ltr">${esc(u.user_id)}</td><td>${esc(u.name)}</td>`+
+  `<td class="ltr">${esc(u.card||'')}</td><td class="ltr">${esc(u.updated||'')}</td>`+
+  `<td><button class="btn p" onclick="startEnroll('${esc(u.device)}','${esc(u.user_id)}','${esc(u.name)}')">شروع ثبت اثر انگشت</button>`+
+  ` <button class="btn" onclick="checkEnroll('${esc(u.device)}','${esc(u.user_id)}')">وضعیت ثبت</button></td></tr>`;
+ $('#users-tbl').innerHTML=h||'<tr><td class="mut">کاربری ثبت نشده است</td></tr>';
+ }catch(e){toast(e.message,1)}}
+async function createUser(){const ip=$('#u-dev').value,id=$('#u-id').value.trim(),name=$('#u-name').value.trim();
+ if(ip==='all'){toast('ابتدا یک دستگاه مشخص انتخاب کنید',1);return}
+ if(!id||!name){toast('شناسه و نام کاربر الزامی است',1);return}
+ try{await api('/api/devices/'+encodeURIComponent(ip)+'/users',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({user_id:id,uid:+$('#u-uid').value||+id,name,card:+$('#u-card').value||0})});
+  toast('کاربر روی دستگاه ساخته شد؛ اکنون ثبت اثر انگشت را شروع کنید');loadUsers();
+ }catch(e){toast(e.message,1)}}
+async function startEnroll(ip,id,name){
+ const src=($('#u-src')?.value||'').trim();
+ if(!src&&!confirm(`کاربر ${name} آماده ثبت اثر انگشت است؟`))return;
+ if(src&&!confirm(`قالب اثر انگشت ${name} از ${src} به ${ip} کپی شود؟\n(اثر انگشت باید از قبل روی دستگاه مبدأ ثبت شده باشد)`))return;
+ try{await api('/api/devices/'+encodeURIComponent(ip)+'/enroll',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({user_id:id,source:src||undefined,name:name})});
+  toast(src?'کپی اثر انگشت آغاز شد':'دستگاه آماده ثبت است؛ انگشت را روی حسگر بگذارید');pollEnroll(ip,id);
+ }catch(e){toast(e.message,1)}}
+async function pollEnroll(ip,id){
+ const timer=setInterval(async()=>{try{const j=await fetch('/api/devices/'+encodeURIComponent(ip)+'/enroll').then(r=>r.json()),e=j.enrollment;
+  if(!e||e.user_id!==id)return;
+  $('#u-sum').textContent=(e.stage?('['+e.stage+'] '):'')+(e.message||'');
+  if(!e.running){clearInterval(timer);toast(e.message||'ثبت اثر انگشت پایان یافت',e.ok===false);loadUsers();}
+ }catch(e){clearInterval(timer);toast(e.message,1)}},1200);
+}
+async function checkEnroll(ip,id){try{const j=await api('/api/devices/'+encodeURIComponent(ip)+'/enroll');
+ const e=j.enrollment;toast(e&&e.user_id===id?(e.message||e.stage):'ثبت فعالی برای این کاربر نیست',e&&e.ok===false);
+ }catch(e){toast(e.message,1)}}
 async function quickLogs(ip){tab('logs',document.querySelectorAll('.tabs button')[2]);
  $('#q-dev').value=ip;fetchLogs();}
 let P_TIMER=null;
@@ -2164,6 +3215,29 @@ async function fetchLogs(){const q=Q();LAST_Q=q;$('#log-sum').textContent='در 
  try{const j=await api('/api/logs?'+q);renderLogTable(j);}
  catch(e){$('#log-sum').textContent='';toast(e.message,1)}
  finally{clearInterval(P_TIMER);P_TIMER=null;setTimeout(pollProg,300);}}
+async function fetchArchivedLogs(){
+ const q=AQForLogs();LAST_Q=q;$('#log-sum').textContent='در حال خواندن بایگانی…';
+ try{const j=await api('/api/archive?'+q);renderLogTable(j);
+  $('#log-sum').textContent=`${j.records.length} رکورد از بایگانی محلی (بدون اتصال به دستگاه)`;
+ }catch(e){$('#log-sum').textContent='';toast(e.message,1)}
+}
+async function fetchNewLogs(){
+ const q=Q();LAST_Q=q;$('#log-sum').textContent='در حال دریافت زنده و مقایسه با دیتابیس…';
+ $('#fetch-prog').textContent='دریافت کامل دستگاه ممکن است چند دقیقه طول بکشد؛ بعد فقط رکوردهای جدید نمایش داده می‌شود.';
+ if(P_TIMER)clearInterval(P_TIMER);P_TIMER=setInterval(pollProg,1000);
+ try{const j=await api('/api/logs/new?'+q);renderLogTable(j);
+    if(j.pending){
+    $('#log-sum').textContent='درخواست دریافت جدید ثبت شد؛ منتظر polling دستگاه';
+     setTimeout(fetchArchivedLogs,7000);
+    }else $('#log-sum').textContent=`${j.total} رکورد جدید که در دیتابیس موجود نیست`+
+     (Object.keys(j.errors||{}).length?` — خطا: ${Object.entries(j.errors).map(([k,v])=>k+': '+v).join(' | ')}`:'');
+ }catch(e){$('#log-sum').textContent='';toast(e.message,1)}
+ finally{clearInterval(P_TIMER);P_TIMER=null;setTimeout(pollProg,300);}
+}
+function AQForLogs(){const p=new URLSearchParams({device:$('#q-dev').value||'all'});
+ if($('#q-from').value)p.set('from',$('#q-from').value);
+ if($('#q-to').value)p.set('to',$('#q-to').value);
+ p.set('limit','20000');return p.toString();}
 async function pollProg(){try{
  const j=await fetch('/api/fetch-progress').then(r=>r.json());
  const p=j.progress||{},selected=$('#q-dev')?.value||'all';let lines=[];
@@ -2178,6 +3252,25 @@ function Q(){const p=new URLSearchParams({device:$('#q-dev').value||'all'});
  const timeout=$('#q-timeout').value.trim();
  if(timeout)p.set('timeout',timeout);
  return p.toString();}
+function fillConnectionSelect(){const s=$('#c-dev'),v=s.value;
+ s.innerHTML='<option value="all">همه دستگاه‌ها</option>'+
+  DEVS.map(d=>`<option value="${d.ip}">${esc(d.ip)} ${esc(d.label||d.info?.model||'')}</option>`).join('');
+ if(v)s.value=v;}
+function clearConnectionTable(){$('#conn-tbl').innerHTML='';$('#c-sum').textContent='';}
+async function loadConnectionLogs(){try{
+ const j=await api('/api/connection-logs?device='+encodeURIComponent($('#c-dev').value||'all')+'&limit=2000');
+ $('#c-sum').textContent=`${j.logs.length} رویداد — نگهداری حداکثر ۲۰۰۰ رویداد اخیر`;
+ let h='<tr><th>زمان</th><th>دستگاه</th><th>رویداد</th><th>جزئیات</th><th>نتیجه</th><th>منبع</th></tr>';
+ for(const r of j.logs){const result=r.ok===true?'موفق':r.ok===false?'خطا':'—';
+  h+=`<tr><td class="ltr">${esc(r.time)}</td><td class="ltr">${esc(r.device)}</td>`+
+     `<td>${esc(r.event)}</td><td>${esc(r.detail)}</td><td>${result}</td>`+
+     `<td>${esc(r.source)}</td></tr>`;}
+ $('#conn-tbl').innerHTML=h||'<tr><td class="mut">لاگی ثبت نشده است</td></tr>';
+ }catch(e){toast(e.message,1)}}
+async function stopSync(){try{
+ const j=await api('/api/sync/stop',{method:'POST'});
+ toast(j.message||'درخواست توقف ثبت شد');loadSync();
+ }catch(e){toast(e.message,1)}}
 function renderLogTable(j){
  $('#log-sum').textContent=`${j.total} رکورد تردد`+
   (Object.keys(j.errors||{}).length?` — خطا: ${Object.entries(j.errors).map(([k,v])=>k+': '+v).join(' | ')}`:'');
@@ -2226,8 +3319,12 @@ async function approveSn(sn){try{
   body:JSON.stringify({sn})});toast('دستگاه '+sn+' تأیید شد');loadSync();}catch(e){toast(e.message,1)}}
 async function admsQuery(sn,table){try{
  const j=await api('/api/adms/query',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({device:sn,table})});
+    body:JSON.stringify({device:admsDevice(sn),table})});
  toast('دستور #'+j.cmd_id+' در صف قرار گرفت — منتظر polling دستگاه…');loadSync();}catch(e){toast(e.message,1)}}
+function admsDevice(sn){
+ const d=DEVS.find(item=>(item.info?.serial||'').trim()===sn);
+ return d?.ip||sn;
+}
 async function loadSync(){try{
  const j=await api('/api/sync');
  $('#sy-en').value=j.auto?.enabled?'1':'0';$('#sy-int').value=j.auto?.interval||900;
