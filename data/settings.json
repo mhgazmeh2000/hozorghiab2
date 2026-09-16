@@ -1,0 +1,37 @@
+{
+  "cache_ttl": {
+    "devices": 5,
+    "scan": 10,
+    "connection_logs": 5,
+    "archive": 30,
+    "sync": 2
+  },
+  "lock_timeout": {
+    "default": 45,
+    "fk": 8,
+    "set_time": 10
+  },
+  "sync": {
+    "auto_interval": 900,
+    "lock_queue_timeout": 30
+  },
+  "backup": {
+    "interval_hours": 6,
+    "keep": 10
+  },
+  "log": {
+    "max_bytes": 2000000,
+    "backups": 3
+  },
+  "web": {
+    "threads": 16
+  },
+  "ui_polling": {
+    "devices_ms": 8000,
+    "sync_ms": 5000,
+    "scan_ms": 2000,
+    "enroll_ms": 1200,
+    "progress_active_ms": 1000,
+    "progress_idle_ms": 5000
+  }
+}

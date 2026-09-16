@@ -11,18 +11,25 @@ Single-file Flask app.
 وابستگی‌ها  :  pip install flask pyzk openpyxl
 """
 
+import atexit
 import csv
 import io
 import json
+import logging
 import os
+import queue
 import re
+import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import calendar
@@ -115,6 +122,8 @@ def db_save_attendance(device_ip, recs, source="pull"):
             " VALUES(?,?,?,?,?,?)",
             [(r["device"], r["user_id"], r["timestamp"], r.get("punch"),
               r.get("status"), source) for r in recs])
+        if cur.rowcount:
+            cache_invalidate("archive")
         return cur.rowcount
 
 
@@ -132,6 +141,8 @@ def db_save_users(device_ip, users):
             [(device_ip, str(u.get("user_id") or u.get("uid") or ""),
               u.get("name", ""), int(u.get("privilege") or 0),
               str(u.get("card") or "0"), now) for u in users])
+        if cur.rowcount:
+            cache_invalidate("archive")
         return cur.rowcount
 
 
@@ -887,21 +898,32 @@ class FKClient:
         return records, names
 
 
+def _acquire_device_lock(ip: str, timeout: float):
+    """Try to take the per-device lock for up to `timeout` seconds.
+    Returns the lock or None — callers fail fast with a clear message
+    instead of queueing for a fixed 30 s while a full pull runs."""
+    lock = _dev_lock_for(ip)
+    deadline = time.monotonic() + timeout
+    while True:
+        if lock.acquire(blocking=False):
+            return lock
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
 def fk_fetch_logs(dev: dict, include_users: bool = True):
     """Fetch attendance via the FK-5005 protocol. Same contract as
     zk_fetch_logs: (records, users_count, error|None), never raises."""
     ip = dev["ip"]
     port = int(dev.get("port", 5005) or 5005)
-    lock = _dev_lock_for(ip)
     _fp(ip, "lock-wait", "در انتظار آزاد شدن دستگاه…")
-    deadline = time.monotonic() + 30
-    while True:
-        if lock.acquire(blocking=False):
-            break
-        if time.monotonic() >= deadline:
-            _fp(ip, "error", "قفل دستگاه بیش از ۳۰ ثانیه آزاد نشد", ok=False)
-            return [], 0, "device busy (lock timeout after 30s)"
-        time.sleep(0.25)
+    # FK exchanges are short — a short real wait beats a fixed 30 s stall.
+    lock = _acquire_device_lock(
+        ip, float(dev.get("lock_timeout", cfg("lock_timeout.fk", 8))))
+    if lock is None:
+        _fp(ip, "error", "دستگاه مشغول است (قفل آزاد نشد)", ok=False)
+        return [], 0, "device busy (lock timeout)"
     try:
         _fp(ip, "connect", f"اتصال FK5005 به {ip}:{port}")
         with FKClient(ip, port, timeout=int(dev.get("timeout", 10))) as fk:
@@ -964,14 +986,18 @@ def zk_fetch_logs(dev: dict, include_users: bool = True, fresh: bool = False):
     ip = dev["ip"]
     lock = _dev_lock_for(ip)
     _fp(ip, "lock-wait", "در انتظار آزاد شدن دستگاه (همگام‌سازی دیگر…)")
-    deadline = time.monotonic() + 30
-    while True:
-        if lock.acquire(blocking=False):
-            break
-        if time.monotonic() >= deadline:
-            _fp(ip, "error", "قفل دستگاه بیش از ۳۰ ثانیه آزاد نشد", ok=False)
-            return [], 0, "device busy (lock timeout after 30s)"
-        time.sleep(0.25)
+    # Green-label full pulls legitimately hold the lock for minutes, so the
+    # wait scales with the device: honor per-device `lock_timeout`, else
+    # default 45 s (long enough to slot in behind a short poll, short enough
+    # to fail fast when a multi-minute pull is running). Callers that really
+    # want to queue can set lock_timeout higher in the device registry.
+    lock_wait = float(
+        dev.get("lock_timeout", cfg("lock_timeout.default", 45)))
+    lock = _acquire_device_lock(ip, lock_wait)
+    if lock is None:
+        _fp(ip, "error", "دستگاه مشغول همگام‌سازی طولانی است (قفل آزاد نشد)",
+            ok=False)
+        return [], 0, "device busy (lock timeout after %ds)" % int(lock_wait)
     conn = None
     try:
         _fp(ip, "connect", f"اتصال به {ip}:{dev.get('port', 4370)}")
@@ -1032,16 +1058,12 @@ def zk_set_time(dev: dict, target=None):
     per-device lock with syncs — and a green-label sync holds that lock for
     minutes. Acquire non-blocking with a hard timeout: fail fast with a clear
     message instead of hanging the HTTP request silently."""
-    lock = _dev_lock_for(dev["ip"])
-    deadline = time.monotonic() + 10
-    while True:
-        if lock.acquire(blocking=False):
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "دستگاه مشغول همگام‌سازی است؛ پایان عملیات چند دقیقه طول "
-                "می‌کشد — چند لحظه بعد دوباره تلاش کنید")
-        time.sleep(0.2)
+    lock = _acquire_device_lock(
+        dev["ip"], cfg("lock_timeout.set_time", 10))
+    if lock is None:
+        raise RuntimeError(
+            "دستگاه مشغول همگام‌سازی است؛ پایان عملیات چند دقیقه طول "
+            "می‌کشد — چند لحظه بعد دوباره تلاش کنید")
     conn = None
     try:
         conn = _zk(dev).connect()
@@ -1076,7 +1098,212 @@ def _connection_log(ip, event, detail="", ok=None, source="sync"):
     with CONNECTION_LOG_LOCK:
         CONNECTION_LOG.append(entry)
         del CONNECTION_LOG[:-CONNECTION_LOG_LIMIT]
+    cache_invalidate("conn")
     return entry
+
+
+# ----------------------------------------------------------------------------
+# Tiny TTL cache for read-heavy endpoints (no Redis — a dict + lock is enough
+# for this single-process app). cache_get(key, ttl, producer) returns the
+# cached payload for `ttl` seconds; cache_invalidate(*keys) drops entries
+# early (called on writes: sync finished, device registry changed, ADMS push
+# stored punches) so the UI never sees stale data after a state change.
+# ----------------------------------------------------------------------------
+_CACHE: dict = {}                    # key -> (expires_at_monotonic, payload)
+_CACHE_LOCK = threading.Lock()
+
+
+def cache_get(key: str, ttl: float, producer):
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    payload = producer()           # build OUTSIDE the lock (re-entrancy safe)
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.monotonic() + ttl, payload)
+    return payload
+
+
+def cache_invalidate(*keys):
+    with _CACHE_LOCK:
+        if not keys:
+            _CACHE.clear()
+        else:
+            for k in keys:
+                _CACHE.pop(k, None)
+
+
+# ----------------------------------------------------------------------------
+# Runtime settings — data/settings.json, editable live from the UI (تنظیمات).
+# Precedence everywhere: settings.json > env var > code default. cfg() is the
+# single accessor; values take effect immediately (no restart) except where
+# a component binds once at boot (waitress threads — noted in the UI).
+# ----------------------------------------------------------------------------
+
+_SETTINGS_DEFAULTS = {
+    "cache_ttl": {
+        "devices": 5,
+        "scan": 10,
+        "connection_logs": 5,
+        "archive": 30,
+        "sync": 2,
+    },
+    "lock_timeout": {
+        "default": 45,     # ZK green-label full pulls
+        "fk": 8,           # FK-5005 short exchanges
+        "set_time": 10,    # time sync / user-management ops
+    },
+    "sync": {
+        "auto_interval": 900,    # seconds between auto-sync passes
+        "lock_queue_timeout": 30,
+    },
+    "backup": {
+        "interval_hours": 6,
+        "keep": 10,              # keep the N most recent backups
+    },
+    "log": {
+        "max_bytes": 2000000,
+        "backups": 3,
+    },
+    "web": {
+        "threads": 16,           # applied at boot (waitress binds once)
+    },
+    "ui_polling": {              # consumed by the browser, not the server
+        "devices_ms": 8000,
+        "sync_ms": 5000,
+        "scan_ms": 2000,
+        "enroll_ms": 1200,
+        "progress_active_ms": 1000,
+        "progress_idle_ms": 5000,
+    },
+}
+
+# numeric ranges for POST /api/settings validation: dotted key -> (min, max)
+_SETTINGS_RANGE = {
+    "cache_ttl.devices": (0, 600),
+    "cache_ttl.scan": (0, 600),
+    "cache_ttl.connection_logs": (0, 600),
+    "cache_ttl.archive": (0, 600),
+    "cache_ttl.sync": (0, 600),
+    "lock_timeout.default": (3, 600),
+    "lock_timeout.fk": (1, 120),
+    "lock_timeout.set_time": (1, 120),
+    "sync.auto_interval": (60, 86400),
+    "sync.lock_queue_timeout": (5, 600),
+    "backup.interval_hours": (1, 168),
+    "backup.keep": (1, 100),
+    "log.max_bytes": (100_000, 100_000_000),
+    "log.backups": (0, 20),
+    "web.threads": (1, 64),
+    "ui_polling.devices_ms": (2000, 600000),
+    "ui_polling.sync_ms": (2000, 600000),
+    "ui_polling.scan_ms": (1000, 600000),
+    "ui_polling.enroll_ms": (500, 60000),
+    "ui_polling.progress_active_ms": (500, 60000),
+    "ui_polling.progress_idle_ms": (2000, 600000),
+}
+
+
+def _settings_path() -> Path:
+    return DATA_DIR / "settings.json"
+
+
+def _deep_merge(dst: dict, src: dict) -> dict:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+def load_settings() -> dict:
+    """defaults <- settings.json (missing/invalid file simply keeps defaults)."""
+    merged = json.loads(json.dumps(_SETTINGS_DEFAULTS))    # deep copy
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        if isinstance(stored, dict):
+            _deep_merge(merged, stored)
+    except (OSError, ValueError):
+        pass
+    return merged
+
+
+def _validate_settings(new_values: dict) -> list:
+    """Whitelist + numeric-range check; returns a list of error strings."""
+    errs = []
+    def walk(sub, prefix):
+        for k, v in sub.items():
+            dotted = f"{prefix}.{k}" if prefix else k
+            if dotted not in _SETTINGS_RANGE:
+                if isinstance(v, dict) and any(
+                        d.startswith(dotted + ".") for d in _SETTINGS_RANGE):
+                    walk(v, dotted)
+                else:
+                    errs.append(f"کلید ناشناخته: {dotted}")
+                continue
+            lo, hi = _SETTINGS_RANGE[dotted]
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool)                 and lo <= v <= hi
+            if not ok:
+                errs.append(f"{dotted} باید عددی بین {lo} و {hi} باشد")
+            elif isinstance(v, float) and v.is_integer():
+                sub[k] = int(v)
+    walk(new_values, "")
+    return errs
+
+
+def save_settings(new_values: dict) -> dict:
+    """Merge validated keys into settings.json; refresh the live dict."""
+    with _SETTINGS_LOCK:
+        current = load_settings()
+        _deep_merge(current, new_values)
+        tmp = _settings_path().with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(current, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _settings_path())   # atomic swap, works on all OSes
+        _SETTINGS.clear()
+        _SETTINGS.update(current)
+    return current
+
+
+_SETTINGS: dict = load_settings()
+_SETTINGS_LOCK = threading.Lock()
+
+
+def _env_num(name: str, default):
+    try:
+        v = os.environ.get(name)
+        return int(v) if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _lookup(dotted: str, root: dict):
+    node = root
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def cfg(dotted: str, default=None):
+    """Precedence: settings.json > env var > built-in default > caller default."""
+    node = _lookup(dotted, _SETTINGS)
+    if node is not None:
+        return node
+    env = os.environ.get("HOZOR_" + dotted.upper().replace(".", "_"))
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    builtin = _lookup(dotted, _SETTINGS_DEFAULTS)
+    if builtin is not None:
+        return builtin
+    return default
 
 
 def _sync_one(dev: dict) -> dict:
@@ -1180,13 +1407,12 @@ def _revival_watch_loop():
                             continue
                 except Exception:
                     continue
+                if ip in _SYNC_PENDING_IPS:
+                    continue
                 _connection_log(ip, "revival",
                                 "دستگاه FK دوباره پاسخ داد — همگام‌سازی فوری",
                                 ok=True)
-                try:
-                    _sync_one(d)
-                except Exception:
-                    pass
+                _sync_queue_job([d])
                 time.sleep(5)
                 continue
             try:
@@ -1195,6 +1421,8 @@ def _revival_watch_loop():
                            ommit_ping=True).connect()
                 probe.disconnect()
             except Exception:
+                continue
+            if ip in _SYNC_PENDING_IPS:
                 continue
             _connection_log(ip, "revival",
                             "دستگاه دوباره پاسخ داد — همگام‌سازی فوری",
@@ -1231,30 +1459,72 @@ def _revival_watch_loop():
             except Exception:
                 pass
             try:
-                _sync_one(d)
+                _sync_queue_job([d])
             except Exception:
                 pass
-            time.sleep(5)
+            time.sleep(5)# Single serialized sync worker: auto-sync passes, manual /api/sync runs and
+# revival-watch urgent syncs all go through one queue and one thread — two
+# passes can never interleave and fight over the same per-device lock.
+_SYNC_QUEUE: "queue.Queue" = queue.Queue()
+_SYNC_WORKER_STARTED = False
+
+
+def _sync_queue_job(devices):
+    """Queue a sync job for `devices`; starts the worker on first use."""
+    global _SYNC_WORKER_STARTED
+    if not _SYNC_WORKER_STARTED:
+        with _dev_lock:
+            if not _SYNC_WORKER_STARTED:
+                threading.Thread(target=_sync_worker_loop, daemon=True,
+                                 name="sync-worker").start()
+                _SYNC_WORKER_STARTED = True
+    for d in devices:
+        _SYNC_PENDING_IPS.add(d["ip"])
+    _SYNC_QUEUE.put(devices)
+
+
+_SYNC_PENDING_IPS: set = set()
+
+
+def _sync_worker_loop():
+    while True:
+        devices = _SYNC_QUEUE.get()          # blocks; single consumer
+        try:
+            if SYNC_STATE["running"]:
+                # Serialize behind an in-flight pass instead of interleaving.
+                while SYNC_STATE["running"] and not SYNC_STATE["stop"]:
+                    time.sleep(1)
+            SYNC_STATE["running"] = True
+            SYNC_STATE["cancel_requested"] = False
+            results = {}
+            for d in devices:
+                if SYNC_STATE["cancel_requested"]:
+                    break
+                try:
+                    results[d["ip"]] = _sync_one(d)
+                except Exception as e:
+                    results[d["ip"]] = {"error": f"{type(e).__name__}: {e}"}
+                finally:
+                    _SYNC_PENDING_IPS.discard(d["ip"])
+            SYNC_STATE["last_results"] = results
+            SYNC_STATE["last_run"] = datetime.now().isoformat(timespec="seconds")
+        finally:
+            SYNC_STATE["running"] = False
+            SYNC_STATE["cancel_requested"] = False
+            cache_invalidate("sync", "devices")
+            _SYNC_QUEUE.task_done()
 
 
 def _auto_sync_loop():
     db_init()
     while not SYNC_STATE["stop"]:
-        interval = int(DB.get("auto_sync", {}).get("interval", 900))
+        interval = int(DB.get("auto_sync", {}).get(
+            "interval", cfg("sync.auto_interval", 900)))
         enabled = bool(DB.get("auto_sync", {}).get("enabled", True))
         if enabled and not SYNC_STATE["running"]:
-            SYNC_STATE["running"] = True
-            SYNC_STATE["cancel_requested"] = False
-            results = {}
-            for d in list(DB["devices"]):
-                if (d.get("enabled") and not SYNC_STATE["stop"]
-                        and not SYNC_STATE["cancel_requested"]):
-                    results[d["ip"]] = _sync_one(d)
-            SYNC_STATE["last_results"] = results
-            SYNC_STATE["last_run"] = datetime.now().isoformat(
-                timespec="seconds")
-            SYNC_STATE["running"] = False
-            SYNC_STATE["cancel_requested"] = False
+            targets = [d for d in list(DB["devices"]) if d.get("enabled")]
+            if targets:
+                _sync_queue_job(targets)     # same worker as manual sync
         for _ in range(max(60, interval)):
             if SYNC_STATE["stop"]:
                 return
@@ -1598,6 +1868,8 @@ def _adms_store_events(device_ip, body):
                 "INSERT OR IGNORE INTO attendance(device,user_id,ts,punch,"
                 "status,source) VALUES(?,?,?,?,?,?)",
                 (device_ip, uid, ts, punch, status, "adms"))
+            if cur.rowcount:
+                cache_invalidate("archive")
             n += cur.rowcount
     return n
 
@@ -1824,6 +2096,7 @@ def _scan_worker(subnets: list, timeout: float, deep: bool):
     SCAN["progress"] = f"پایان — {len(found)} دستگاه یافت شد"
     SCAN["running"] = False
     SCAN["finished"] = datetime.now().isoformat(timespec="seconds")
+    cache_invalidate("scan", "devices")
 
 
 # ----------------------------------------------------------------------------
@@ -1845,7 +2118,11 @@ def health():
 # ---------------- devices CRUD ----------------
 @app.get("/api/devices")
 def api_devices():
-    return jsonify(devices=DB["devices"], subnets=DB.get("subnets", []))
+    # 5 s TTL: kills the per-keystroke device-table churn without hiding
+    # state changes (every registry write below calls cache_invalidate).
+    return cache_get("devices", cfg("cache_ttl.devices", 5.0),
+                      lambda: jsonify(
+        devices=DB["devices"], subnets=DB.get("subnets", [])))
 
 
 @app.post("/api/devices")
@@ -1871,6 +2148,7 @@ def api_device_add():
                "last_check": None, "last_log_ts": None}
         DB["devices"].append(dev)
         _save(DB)
+    cache_invalidate("devices")
     return jsonify(ok=True, device=dev)
 
 
@@ -1889,6 +2167,7 @@ def api_device_edit(ip):
         if "enabled" in b:
             dev["enabled"] = bool(b["enabled"])
         _save(DB)
+    cache_invalidate("devices")
     return jsonify(ok=True, device=dev)
 
 
@@ -1900,6 +2179,7 @@ def api_device_del(ip):
             return jsonify(error="یافت نشد"), 404
         DB["devices"].remove(dev)
         _save(DB)
+    cache_invalidate("devices")
     return jsonify(ok=True)
 
 
@@ -1914,6 +2194,7 @@ def api_device_ping(ip):
     dev["last_state"] = "online" if network_online else "offline"
     dev["last_check"] = datetime.now().isoformat(timespec="seconds")
     _save(DB)
+    cache_invalidate("devices")
     return jsonify(ok=network_online, tcp_ok=ok, latency_ms=ms,
                    state=dev["last_state"])
 
@@ -1938,6 +2219,7 @@ def api_device_identify(ip):
             dev["last_check"] = datetime.now().isoformat(timespec="seconds")
             _save(DB)
             info = dict(info, fk_record_count=count)
+            cache_invalidate("devices")
             return jsonify(ok=True, info=info)
         info = zk_identify(dev)
         return jsonify(ok=True, info=info)
@@ -2271,12 +2553,19 @@ def api_connection_logs():
     ip = request.args.get("device", "all").strip()
     limit = min(max(int(request.args.get("limit", 500)), 1),
                 CONNECTION_LOG_LIMIT)
-    with CONNECTION_LOG_LOCK:
-        rows = list(CONNECTION_LOG)
-    if ip != "all":
-        rows = [row for row in rows if row["device"] == ip]
-    return jsonify(ok=True, logs=rows[-limit:][::-1],
-                   total=len(rows), devices=[d["ip"] for d in DB["devices"]])
+
+    def build():
+        with CONNECTION_LOG_LOCK:
+            rows = list(CONNECTION_LOG)
+        if ip != "all":
+            rows = [row for row in rows if row["device"] == ip]
+        return jsonify(ok=True, logs=rows[-limit:][::-1],
+                       total=len(rows),
+                       devices=[d["ip"] for d in DB["devices"]])
+
+    # 5 s TTL; the limit=2000 dashboard-style calls collapse into one build.
+    return cache_get(f"conn:{ip}:{limit}",
+                     cfg("cache_ttl.connection_logs", 5.0), build)
 
 
 @app.get("/api/logs")
@@ -2439,11 +2728,18 @@ def api_new_logs():
 # ---------------- archive / auto-sync / ADMS ----------------
 @app.get("/api/archive")
 def api_archive():
-    """Instant queries over the local SQLite mirror."""
+    """Instant queries over the local SQLite mirror (30 s TTL cache,
+    invalidated by every attendance/employee write)."""
     ip = request.args.get("device", "all")
     d_from, d_to = request.args.get("from"), request.args.get("to")
     q = request.args.get("q", "").strip()
     limit = min(int(request.args.get("limit", 5000)), 100000)
+    ck = f"arch:{ip}:{d_from}:{d_to}:{q}:{limit}"
+    return cache_get(ck, cfg("cache_ttl.archive", 30.0),
+                     lambda: _archive_query(ip, d_from, d_to, q, limit))
+
+
+def _archive_query(ip, d_from, d_to, q, limit):
     sql = "SELECT device,user_id,ts,punch,status,source FROM attendance WHERE 1=1"
     args = []
     if ip != "all":
@@ -2483,7 +2779,6 @@ def api_archive():
     } for r in rows]
     return jsonify(ok=True, total=total, shown=len(recs), records=recs)
 
-
 @app.get("/api/employees")
 def api_employees():
     with _sqlite_lock, _db() as con:
@@ -2497,7 +2792,7 @@ def api_employees():
 
 @app.post("/api/sync")
 def api_sync_now():
-    """Sync one device (or all) right now, in the background."""
+    """Sync one device (or all) right now, via the single sync worker."""
     if SYNC_STATE["running"]:
         return jsonify(error="همگام‌سازی در حال اجراست"), 409
     ip = (request.get_json(force=True, silent=True) or {}).get("device", "all")
@@ -2506,20 +2801,7 @@ def api_sync_now():
     if ip != "all" and not targets:
         return jsonify(error="یافت نشد"), 404
 
-    def run():
-        SYNC_STATE["running"] = True
-        SYNC_STATE["cancel_requested"] = False
-        results = {}
-        for d in targets:
-            if SYNC_STATE["cancel_requested"]:
-                break
-            results[d["ip"]] = _sync_one(d)
-        SYNC_STATE["last_results"] = results
-        SYNC_STATE["last_run"] = datetime.now().isoformat(timespec="seconds")
-        SYNC_STATE["running"] = False
-        SYNC_STATE["cancel_requested"] = False
-
-    threading.Thread(target=run, daemon=True).start()
+    _sync_queue_job(targets)
     return jsonify(ok=True, started=True, devices=[d["ip"] for d in targets])
 
 
@@ -2530,11 +2812,17 @@ def api_sync_stop():
     SYNC_STATE["cancel_requested"] = True
     _connection_log(SYNC_STATE.get("current_device") or "all", "sync-stop",
                     "درخواست توقف توسط کاربر", ok=None, source="user")
+    cache_invalidate("sync")
     return jsonify(ok=True, stopped=True, message="توقف پس از پایان دستگاه جاری انجام می‌شود")
 
 
 @app.get("/api/sync")
 def api_sync_state_ep():
+    # 2 s TTL — the Sync tab polls this; state flips invalidate it below.
+    return cache_get("sync", cfg("cache_ttl.sync", 2.0), _sync_state_payload)
+
+
+def _sync_state_payload():
     with _sqlite_lock, _db() as con:
         states = con.execute(
             "SELECT device,last_sync,last_count,last_error FROM sync_state").fetchall()
@@ -2559,7 +2847,50 @@ def api_sync_settings():
         if "interval" in b:
             a["interval"] = max(60, int(b["interval"]))
         _save(DB)
+    cache_invalidate("sync")
     return jsonify(ok=True, auto=a)
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    """Full runtime settings + where the backup dir lives (native separators)."""
+    env_overrides = []
+    for dotted in sorted(_SETTINGS_RANGE):
+        env_name = "HOZOR_" + dotted.upper().replace(".", "_")
+        if os.environ.get(env_name):
+            env_overrides.append(env_name)
+    return jsonify(ok=True, settings=load_settings(),
+                   defaults=json.loads(json.dumps(_SETTINGS_DEFAULTS)),
+                   backup_dir=str(DATA_DIR / "backups"),
+                   settings_file=str(_settings_path()),
+                   env_overrides=env_overrides,
+                   note="web.threads در بوت اعمال می‌شود (بعد از تغییر، ری‌استارت لازم است)")
+
+
+@app.post("/api/settings")
+def api_settings_post():
+    """Update settings live. Whitelisted numeric keys only; atomic save."""
+    b = request.get_json(force=True, silent=True)
+    if not isinstance(b, dict) or not b:
+        return jsonify(ok=False, error="بدنهٔ درخواست نامعتبر است"), 400
+    errs = _validate_settings(b)
+    if errs:
+        return jsonify(ok=False, error="؛ ".join(errs)), 400
+    saved = save_settings(b)
+    # TTLs changed -> drop cached payloads so new values take effect at once
+    cache_invalidate()
+    _connection_log("server", "settings", 
+                    ", ".join(sorted(_flatten_keys(b))),
+                    ok=True, source="system")
+    return jsonify(ok=True, settings=saved)
+
+
+def _flatten_keys(d: dict, prefix: str = "") -> list:
+    out = []
+    for k, v in d.items():
+        dotted = f"{prefix}.{k}" if prefix else k
+        out.extend(_flatten_keys(v, dotted) if isinstance(v, dict) else [dotted])
+    return out
 
 
 @app.get("/api/adms")
@@ -2674,7 +3005,11 @@ def api_scan_start():
 
 @app.get("/api/scan")
 def api_scan_state():
-    return jsonify(SCAN)
+    # 10 s TTL — but only while idle; a running scan is always served live.
+    if SCAN["running"]:
+        return jsonify(SCAN)
+    return cache_get("scan", cfg("cache_ttl.scan", 10.0),
+                     lambda: jsonify(SCAN))
 
 
 @app.post("/api/scan/adopt")
@@ -2785,6 +3120,30 @@ HTML_PAGE = r"""<!doctype html>
 :root{--bg:#0f172a;--card:#1e293b;--card2:#273449;--txt:#e2e8f0;--mut:#94a3b8;
 --acc:#38bdf8;--ok:#34d399;--bad:#f87171;--warn:#fbbf24;--bd:#334155}
 *{box-sizing:border-box}
+
+/* ---------- custom scrollbars (تم هم‌رنگ UI) ---------- */
+/* Firefox */
+*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb,rgba(56,189,248,.45)) transparent}
+/* Webkit (Chrome/Edge/Safari) */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(56,189,248,.45);border-radius:8px;
+ border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(56,189,248,.75);
+ border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+/* dark color-scheme so native widgets (select, checkbox) follow the theme */
+:root{color-scheme:dark}
+
+/* fade hint beside horizontally scrollable tables: in RTL the overflow
+   continues at the LEFT edge, so the gradient sits there; it only appears
+   (.has-hscroll) when the table really overflows. Non-interactive. */
+.twrap{position:relative;overflow:auto}
+.twrap::after{content:'';position:absolute;top:0;bottom:0;left:0;width:26px;
+ pointer-events:none;opacity:0;transition:opacity .25s;
+ background:linear-gradient(to left,var(--card),transparent)}
+.twrap.has-hscroll::after{opacity:1}
+
 body{margin:0;background:var(--bg);color:var(--txt);
 font-family:Tahoma,"Segoe UI",sans-serif;font-size:13px}
 header{display:flex;align-items:center;gap:12px;padding:12px 20px;
@@ -2824,6 +3183,53 @@ input,select,textarea{background:#0b1220;color:var(--txt);border:1px solid var(-
 border-radius:6px;padding:6px 8px;font-family:inherit;font-size:12px}
 textarea{width:100%;min-height:90px;direction:ltr;text-align:left}
 label{color:var(--mut);font-size:11px;display:block;margin-bottom:3px}
+#nav-btn{display:none;background:var(--card2);color:var(--txt);border:1px solid var(--bd);
+border-radius:6px;cursor:pointer;font-size:16px;line-height:1;padding:6px 10px}
+#nav-btn:hover{border-color:var(--acc)}
+
+/* ---------- responsive: tablet ≤1024px ---------- */
+@media (max-width:1024px){
+ main{padding:12px}
+ .toast{max-width:300px}
+}
+/* ---------- responsive: small tablet / large phone ≤768px ---------- */
+@media (max-width:768px){
+ ::-webkit-scrollbar{display:none;width:0;height:0}
+ *{scrollbar-width:none;-ms-overflow-style:none}
+ body{font-size:13px}
+ header{padding:8px 10px;gap:8px;position:sticky;top:0}
+ header h1{font-size:13px}
+ .badge{display:none}
+ #nav-btn{display:inline-block}
+ .tabs{display:none;position:absolute;top:0;left:0;right:0;flex-direction:column;
+  gap:0;background:var(--card);border-bottom:1px solid var(--bd);z-index:8;
+  max-height:70vh;overflow-y:auto;margin-bottom:0;padding:4px 0}
+ .tabs button{border-radius:0;border:none;border-bottom:1px solid var(--bd);
+  padding:13px 18px;text-align:right;font-size:14px}
+ .tabs button.on{border-bottom-color:var(--bd)}
+ body.nav-open .tabs{display:flex}
+ main{padding:10px;max-width:100%;position:relative}
+ .row{flex-direction:column;align-items:stretch}
+ .row>div{min-width:0;width:100%}
+ .card{padding:10px;border-radius:8px}
+ .kpi b{font-size:22px}
+ .actions .btn{padding:9px 12px;font-size:13px}
+}
+/* ---------- responsive: phone ≤480px ---------- */
+@media (max-width:480px){
+ body{font-size:14px;overflow-x:hidden}
+ header h1{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ header .btn{padding:9px 10px;min-height:38px}
+ .tabs button{min-height:44px;font-size:14px}
+ .btn,.st-in{min-height:40px;font-size:13px}
+ input,select,textarea{font-size:14px;min-height:40px}
+ label{font-size:12px}
+ td,th{padding:9px 7px;font-size:12px}
+ .card{margin-bottom:10px}
+ .kpi b{font-size:20px}
+ .actions{gap:6px}
+ .actions .btn{flex:1 1 auto}
+}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .row>div{flex:1;min-width:130px}
 .mut{color:var(--mut)} .ltr{direction:ltr;text-align:left;display:inline-block}
@@ -2842,6 +3248,7 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
 </head>
 <body>
 <header>
+  <button id="nav-btn" aria-label="منو" onclick="document.body.classList.toggle('nav-open')">☰</button>
   <h1>🖥 سامانه حضور و غیاب</h1>
   <span class="badge" id="clock"></span>
   <span style="flex:1"></span>
@@ -2860,13 +3267,14 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
   <button data-t="sync" onclick="tab('sync',this)">همگام‌سازی</button>
     <button data-t="conn" onclick="tab('conn',this)">لاگ ارتباط</button>
   <button data-t="scan" onclick="tab('scan',this)">اسکن شبکه</button>
+  <button data-t="settings" onclick="tab('settings',this)">تنظیمات</button>
 </div>
 
 <!-- ============ DASHBOARD ============ -->
 <section id="t-dash">
   <div class="card"><div class="grid" id="kpis"></div></div>
   <div class="card"><h2>وضعیت سریع دستگاه‌ها</h2>
-    <div style="overflow:auto"><table id="dash-tbl"></table></div></div>
+    <div class="twrap"><table id="dash-tbl"></table></div></div>
 </section>
 
 <!-- ============ USERS ============ -->
@@ -2888,13 +3296,13 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
         <div class="mut" style="margin-top:8px">پس از ساخت کاربر، برای ثبت اثر انگشت همان ردیف روی «شروع ثبت اثر انگشت» بزنید و شخص سه بار انگشت خود را روی دستگاه قرار دهد.</div>
         <div id="u-sum" class="mut" style="margin-top:8px"></div>
     </div>
-    <div class="card"><div style="overflow:auto"><table id="users-tbl"></table></div></div>
+    <div class="card"><div class="twrap"><table id="users-tbl"></table></div></div>
 </section>
 
 <!-- ============ DEVICES ============ -->
 <section id="t-devs" style="display:none">
   <div class="card"><h2>دستگاه‌های ثبت‌شده</h2>
-    <div style="overflow:auto"><table id="dev-tbl"></table></div></div>
+    <div class="twrap"><table id="dev-tbl"></table></div></div>
   <div class="card"><h2>افزودن دستگاه</h2>
     <div class="row">
       <div><label>IP دستگاه</label><input id="n-ip" placeholder="172.16.x.x" style="direction:ltr"></div>
@@ -2929,7 +3337,7 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
     <div id="log-sum" class="mut" style="margin-top:8px"></div>
     <div id="fetch-prog" class="mut" style="margin-top:4px;white-space:pre-wrap"></div>
   </div>
-  <div class="card"><div style="overflow:auto;max-height:60vh"><table id="log-tbl"></table></div></div>
+  <div class="card"><div class="twrap" style="max-height:60vh"><table id="log-tbl"></table></div></div>
 </section>
 
 <!-- ============ ARCHIVE ============ -->
@@ -2945,7 +3353,7 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
     </div>
     <div id="a-sum" class="mut" style="margin-top:8px"></div>
   </div>
-  <div class="card"><div style="overflow:auto"><table id="arch-tbl"></table></div></div>
+  <div class="card"><div class="twrap"><table id="arch-tbl"></table></div></div>
 </section>
 
 <!-- ============ SYNC ============ -->
@@ -2961,10 +3369,10 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
     <div id="sy-sum" class="mut" style="margin-top:8px"></div>
   </div>
   <div class="card"><h2>وضعیت دستگاه‌ها</h2>
-    <div style="overflow:auto"><table id="sy-tbl"></table></div></div>
+    <div class="twrap"><table id="sy-tbl"></table></div></div>
   <div class="card"><h2>دستگاه‌های push (ADMS — پورت 8081)</h2>
     <div id="adms-sum" class="mut"></div>
-    <div style="overflow:auto"><table id="adms-tbl"></table></div>
+    <div class="twrap"><table id="adms-tbl"></table></div>
     <div class="mut" style="margin-top:6px">استعلام از طریق پروتکل PUSH (الگوی zkteco_sync): دستور DATA QUERY در صف قرار می‌گیرد و دستگاه در اولین polling، داده را به سرور push می‌کند.</div>
   </div>
 </section>
@@ -2979,7 +3387,7 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
         </div>
         <div id="c-sum" class="mut" style="margin-top:8px"></div>
     </div>
-    <div class="card"><div style="overflow:auto;max-height:65vh"><table id="conn-tbl"></table></div></div>
+    <div class="card"><div class="twrap" style="max-height:65vh"><table id="conn-tbl"></table></div></div>
 </section>
 
 <!-- ============ SCAN ============ -->
@@ -2997,7 +3405,22 @@ padding:1px 7px;font-size:11px;color:var(--mut)}
     <div id="s-prog" class="mut" style="margin-top:6px"></div>
   </div>
   <div class="card"><h2>نتایج</h2>
-    <div style="overflow:auto"><table id="scan-tbl"></table></div></div>
+    <div class="twrap"><table id="scan-tbl"></table></div></div>
+</section>
+
+<!-- ============ SETTINGS ============ -->
+<section id="t-settings" style="display:none">
+  <div class="card">
+    <h2>تنظیمات سیستم</h2>
+    <div class="mut" style="margin-bottom:6px">مقادیر پس از ذخیره بلافاصله اعمال می‌شوند؛ فقط «تعداد نخ وب‌سرور» پس از ری‌استارت برنامه اثر می‌گذارد.
+      فایل تنظیمات: <span id="st-file" class="ltr"></span></div>
+    <div class="mut" id="st-env" style="margin-bottom:10px"></div>
+    <div class="row"><div style="flex:0"><label>&nbsp;</label>
+      <button class="btn p" onclick="saveSettings()">ذخیره همه</button></div>
+      <div style="flex:0"><label>&nbsp;</label>
+      <button class="btn" onclick="loadSettings()">بازخوانی</button></div></div>
+  </div>
+  <div id="st-sections"></div>
 </section>
 
 </main>
@@ -3050,14 +3473,16 @@ async function api(url,opt){
   throw e;
  }}
 
-function tab(id,btn){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
- btn.classList.add('on');['dash','devs','users','logs','arch','sync','conn','scan'].forEach(t=>
+function tab(id,btn){document.body.classList.remove('nav-open');
+ document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
+ btn.classList.add('on');['dash','devs','users','logs','arch','sync','conn','scan','settings'].forEach(t=>
  $('#t-'+t).style.display=t===id?'':'none');
  if(id==='users'){fillUserDeviceSelect();loadUsers();}
  if(id==='logs')fillDevSelect();
  if(id==='arch')fillArchSelect();
  if(id==='sync')loadSync();
- if(id==='conn'){fillConnectionSelect();loadConnectionLogs();}}
+ if(id==='conn'){fillConnectionSelect();loadConnectionLogs();}
+ if(id==='settings')loadSettings();}
 
 /* ---------- dashboard ---------- */
 async function loadDevices(){try{
@@ -3200,21 +3625,30 @@ async function pollEnroll(ip,id){
   if(!e||e.user_id!==id)return;
   $('#u-sum').textContent=(e.stage?('['+e.stage+'] '):'')+(e.message||'');
   if(!e.running){clearInterval(timer);toast(e.message||'ثبت اثر انگشت پایان یافت',e.ok===false);loadUsers();}
- }catch(e){clearInterval(timer);toast(e.message,1)}},1200);
+ }catch(e){clearInterval(timer);toast(e.message,1)}},UI_POLL.enroll_ms);
 }
 async function checkEnroll(ip,id){try{const j=await api('/api/devices/'+encodeURIComponent(ip)+'/enroll');
  const e=j.enrollment;toast(e&&e.user_id===id?(e.message||e.stage):'ثبت فعالی برای این کاربر نیست',e&&e.ok===false);
  }catch(e){toast(e.message,1)}}
 async function quickLogs(ip){tab('logs',document.querySelectorAll('.tabs button')[2]);
  $('#q-dev').value=ip;fetchLogs();}
-let P_TIMER=null;
+let P_TIMER=null,P_ACTIVE=false;
+/* Progress polling with a dynamic interval: 1 s while any device stage is
+   actively running (connect/attlog/…), 5 s once everything is idle/done. */
+function progDelay(){const p=window._PROG_LAST||{};
+ for(const k in p){const s=p[k];if(s.stage&&s.stage!=='done'&&s.stage!=='error')return UI_POLL.progress_active_ms}
+ return UI_POLL.progress_idle_ms;}
+async function progTick(){try{await pollProg()}catch(e){}
+ if(!P_ACTIVE)return;P_TIMER=setTimeout(progTick,progDelay());}
+function startProgPolling(){P_ACTIVE=true;if(!P_TIMER)progTick();}
+function stopProgPolling(){P_ACTIVE=false;
+ if(P_TIMER){clearTimeout(P_TIMER);P_TIMER=null;}}
 async function fetchLogs(){const q=Q();LAST_Q=q;$('#log-sum').textContent='در حال دریافت…';
  $('#fetch-prog').textContent='';
- if(P_TIMER)clearInterval(P_TIMER);
- P_TIMER=setInterval(pollProg,1000);
+ stopProgPolling();startProgPolling();
  try{const j=await api('/api/logs?'+q);renderLogTable(j);}
  catch(e){$('#log-sum').textContent='';toast(e.message,1)}
- finally{clearInterval(P_TIMER);P_TIMER=null;setTimeout(pollProg,300);}}
+ finally{stopProgPolling();setTimeout(pollProg,300);}}
 async function fetchArchivedLogs(){
  const q=AQForLogs();LAST_Q=q;$('#log-sum').textContent='در حال خواندن بایگانی…';
  try{const j=await api('/api/archive?'+q);renderLogTable(j);
@@ -3224,7 +3658,7 @@ async function fetchArchivedLogs(){
 async function fetchNewLogs(){
  const q=Q();LAST_Q=q;$('#log-sum').textContent='در حال دریافت زنده و مقایسه با دیتابیس…';
  $('#fetch-prog').textContent='دریافت کامل دستگاه ممکن است چند دقیقه طول بکشد؛ بعد فقط رکوردهای جدید نمایش داده می‌شود.';
- if(P_TIMER)clearInterval(P_TIMER);P_TIMER=setInterval(pollProg,1000);
+ stopProgPolling();startProgPolling();
  try{const j=await api('/api/logs/new?'+q);renderLogTable(j);
     if(j.pending){
     $('#log-sum').textContent='درخواست دریافت جدید ثبت شد؛ منتظر polling دستگاه';
@@ -3232,7 +3666,7 @@ async function fetchNewLogs(){
     }else $('#log-sum').textContent=`${j.total} رکورد جدید که در دیتابیس موجود نیست`+
      (Object.keys(j.errors||{}).length?` — خطا: ${Object.entries(j.errors).map(([k,v])=>k+': '+v).join(' | ')}`:'');
  }catch(e){$('#log-sum').textContent='';toast(e.message,1)}
- finally{clearInterval(P_TIMER);P_TIMER=null;setTimeout(pollProg,300);}
+ finally{stopProgPolling();setTimeout(pollProg,300);}
 }
 function AQForLogs(){const p=new URLSearchParams({device:$('#q-dev').value||'all'});
  if($('#q-from').value)p.set('from',$('#q-from').value);
@@ -3240,6 +3674,7 @@ function AQForLogs(){const p=new URLSearchParams({device:$('#q-dev').value||'all
  p.set('limit','20000');return p.toString();}
 async function pollProg(){try{
  const j=await fetch('/api/fetch-progress').then(r=>r.json());
+ window._PROG_LAST=j.progress||{};
  const p=j.progress||{},selected=$('#q-dev')?.value||'all';let lines=[];
  for(const ip in p){const s=p[ip];
     if(selected!=='all'&&ip!==selected)continue;
@@ -3371,7 +3806,7 @@ async function startScan(){
  const nets=$('#s-nets').value.split('\n').map(s=>s.trim()).filter(Boolean);
  try{await api('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({subnets:nets,timeout:+$('#s-to').value||0.6,deep:true})});
- if(!S_TIMER)S_TIMER=setInterval(pollScan,1200);toast('اسکن شروع شد');}
+ if(!S_TIMER)S_TIMER=setInterval(pollScan,UI_POLL.scan_ms);toast('اسکن شروع شد');}
  catch(e){toast(e.message,1)}}
 async function pollScan(){const j=await fetch('/api/scan').then(r=>r.json());
  $('#s-prog').textContent=j.progress||'';
@@ -3395,23 +3830,192 @@ async function adopt(ip,model,serial,platform,firmware){try{
   body:JSON.stringify({ip,model,serial,platform,firmware})});
  toast(ip+' اضافه شد');pollScan();}catch(e){toast(e.message,1)}}
 
+/* ---------- settings (تنظیمات) ---------- */
+const ST_SECTIONS=[
+ {key:'cache_ttl',title:'مدت کش (ثانیه)',desc:'مدت نگهداری پاسخ APIها در حافظه؛ عدد کمتر=داده تازه‌تر، بار بیشتر روی دستگاه‌ها.',
+  fields:[['devices','لیست دستگاه‌ها (/api/devices)'],['scan','نتایج اسکن شبکه'],['connection_logs','لاگ ارتباط'],['archive','بایگانی ترددها'],['sync','وضعیت همگام‌سازی']]},
+ {key:'lock_timeout',title:'تایم‌اوت قفل دستگاه (ثانیه)',desc:'حداکثر انتظار برای آزاد شدن قفل دستگاه قبل از خطای «دستگاه مشغول».',
+  fields:[['default','پول کامل ZK (سبزلیبل)'],['fk','دستگاه FK (پورت 5005)'],['set_time','عملیات سریع (ساعت/کاربر)']]},
+ {key:'sync',title:'همگام‌سازی خودکار',desc:'فاصلهٔ بین پاس‌های همگام‌سازی خودکار؛ بلافاصله در چرخهٔ بعدی اعمال می‌شود.',
+  fields:[['auto_interval','فاصلهٔ همگام‌سازی خودکار (ثانیه، حداقل ۶۰)'],['lock_queue_timeout','صف انتظار صف همگام‌سازی (ثانیه)']]},
+ {key:'backup',title:'پشتیبان‌گیری خودکار',desc:'هر چند ساعت یک کپی ساده از attendance.db گرفته می‌شود.',
+  fields:[['interval_hours','فاصلهٔ بکاپ (ساعت)'],['keep','تعداد بکاپ نگه‌داشتی']],
+  info:()=>('محل ذخیره: '+(window._ST&&window._ST.backup_dir||''))},
+ {key:'log',title:'چرخش لاگ',desc:'اندازهٔ هر فایل attendance.log و تعداد نسخه‌های نگه‌داشتی.',
+  fields:[['max_bytes','حداکثر حجم هر فایل لاگ (بایت)'],['backups','تعداد فایل‌های لاگ قدیمی']]},
+ {key:'web',title:'وب‌سرور',desc:'تغییر تعداد نخ‌ها پس از ری‌استارت برنامه اعمال می‌شود.',
+  fields:[['threads','تعداد نخ وب‌سرور']]},
+ {key:'ui_polling',title:'فاصلهٔ به‌روزرسانی خودکار صفحه (میلی‌ثانیه)',desc:'نرخ polling مرورگر؛ اعداد بزرگ‌تر یعنی ترافیک کمتر.',
+  fields:[['devices_ms','لیست دستگاه‌ها'],['sync','وضعیت همگام‌سازی'],['scan','نتیجهٔ اسکن'],['enroll_ms','ثبت اثر انگشت'],['progress_active_ms','پیشرفت دریافت (فعال)'],['progress_idle_ms','پیشرفت دریافت (بیکار)']]}
+];
+window._ST=null;
+async function loadSettings(){try{
+ const j=await api('/api/settings');window._ST=j;
+ $('#st-file').textContent=j.settings_file||'';
+ $('#st-env').textContent=(j.env_overrides&&j.env_overrides.length)
+   ?('متغیر محیطی فعال (اولویت بالاتر از این فرم): '+j.env_overrides.join('، ')):'';
+ renderSettings(j.settings,j.defaults||{});
+}catch(e){toast(e.message,1)}}
+function renderSettings(s,defs){const box=$('#st-sections');box.innerHTML='';
+ for(const sec of ST_SECTIONS){
+  const card=document.createElement('div');card.className='card';
+  let html=`<h2>${sec.title}</h2><div class="mut">${sec.desc}</div><div class="row" style="margin-top:8px">`;
+  for(const[f,label]of sec.fields){
+   const v=(s[sec.key]||{})[f];const lo=window._ST_RANGES[sec.key+'.'+f];
+   html+=`<div style="flex:0;min-width:170px"><label>${label}</label>`+
+     `<input class="st-in" data-k="${sec.key}.${f}" value="${v??''}"`+
+     (lo?` min="${lo[0]}" max="${lo[1]}"`:``)+` style="direction:ltr"></div>`;}
+  if(sec.info)html+=`<div style="flex:1"><label>&nbsp;</label><div class="mut">${sec.info()}</div></div>`;
+  html+=`<div style="flex:1"></div><div style="flex:0"><label>&nbsp;</label>`+
+   `<button class="btn" onclick="resetSection('${sec.key}')">بازگشت به پیش‌فرض</button></div>`;
+  card.innerHTML=html+'</div>';box.appendChild(card);}}
+window._ST_RANGES={
+ 'cache_ttl.devices':[0,600],'cache_ttl.scan':[0,600],'cache_ttl.connection_logs':[0,600],
+ 'cache_ttl.archive':[0,600],'cache_ttl.sync':[0,600],
+ 'lock_timeout.default':[3,600],'lock_timeout.fk':[1,120],'lock_timeout.set_time':[1,120],
+ 'sync.auto_interval':[60,86400],'sync.lock_queue_timeout':[5,600],
+ 'backup.interval_hours':[1,168],'backup.keep':[1,100],
+ 'log.max_bytes':[100000,100000000],'log.backups':[0,20],'web.threads':[1,64],
+ 'ui_polling.devices_ms':[2000,600000],'ui_polling.sync_ms':[2000,600000],
+ 'ui_polling.scan_ms':[1000,600000],'ui_polling.enroll_ms':[500,60000],
+ 'ui_polling.progress_active_ms':[500,60000],'ui_polling.progress_idle_ms':[2000,600000]};
+function readSettingsForm(){const out={};
+ document.querySelectorAll('.st-in').forEach(inp=>{
+  const parts=inp.dataset.k.split('.');let node=out;
+  for(let i=0;i<parts.length-1;i++){node[parts[i]]=node[parts[i]]||{};node=node[parts[i]];}
+  const v=parseFloat(inp.value);
+  node[parts[parts.length-1]]=isNaN(v)?inp.value:v;});
+ return out;}
+async function saveSettings(){try{
+ const body=readSettingsForm();
+ const j=await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)});
+ toast('تنظیمات ذخیره شد و بلافاصله اعمال شد');window._ST=Object.assign(window._ST||{},{settings:j.settings});
+ loadPollConfig();renderSettings(j.settings,j.settings);
+}catch(e){toast(e.message,1)}}
+async function resetSection(key){try{
+ const d=(window._ST&&window._ST.defaults&&window._ST.defaults[key])||{};
+ const j=await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({[key]:d})});
+ toast('بخش به پیش‌فرض برگشت');window._ST.settings=j.settings;renderSettings(j.settings,j.defaults||{});
+}catch(e){toast(e.message,1)}}
+
 /* ---------- init ---------- */
 setInterval(()=>{$('#clock').textContent=new Date().toLocaleString('fa-IR')},1000);
 $('#q-from').value=new Date(Date.now()-6*864e5).toISOString().slice(0,10);
 $('#q-to').value=new Date().toISOString().slice(0,10);
 $('#a-from').value='';$('#a-to').value='';
+let UI_POLL={devices_ms:8000,sync_ms:5000,scan_ms:2000,enroll_ms:1200,
+ progress_active_ms:1000,progress_idle_ms:5000};
+function _markTwraps(){document.querySelectorAll('.twrap').forEach(w=>{
+ if(w.scrollWidth>w.clientWidth+4)w.classList.add('has-hscroll');
+ else w.classList.remove('has-hscroll');});}
+setInterval(_markTwraps,1500);window.addEventListener('resize',_markTwraps);
+function loadPollConfig(){try{const s=(window._ST&&window._ST.settings)||{};
+ if(s.ui_polling)Object.assign(UI_POLL,s.ui_polling);}catch(e){}}
+fetch('/api/settings').then(r=>r.json()).then(j=>{window._ST=j;loadPollConfig();
+ if($('#t-settings').style.display!=='none')loadSettings();}).catch(()=>{});
 loadDevices().then(()=>pollScan());
+/* Background refresh: pause entirely while the tab is hidden (saves device
+   pings and battery); rates come from /api/settings (ui_polling). */
+(function schedDevices(){setTimeout(async()=>{if(!document.hidden)await loadDevices();
+   schedDevices()},UI_POLL.devices_ms)})();
+(function schedSync(){setTimeout(async()=>{if(!document.hidden)await loadSync();
+   schedSync()},UI_POLL.sync_ms)})();
+/* Deep-link: #settings (یا نام هر تب) همان تب را هنگام باز شدن صفحه فعال می‌کند */
+(function(){const h=location.hash.replace('#','');if(h){
+ const b=document.querySelector('.tabs button[data-t="'+h+'"]');if(b)tab(h,b);}})();
 </script>
 </body>
 </html>
 """
 
 # ----------------------------------------------------------------------------
+# Production runtime: waitress WSGI server (multi-threaded, stable on
+# Windows), rotating file logging, periodic DB backup, graceful shutdown.
+# ----------------------------------------------------------------------------
+LOG_FILE = BASE_DIR / "attendance.log"
+WEB_THREADS = int(cfg("web.threads", _env_num("WEB_THREADS", 16)))
+
+
+def _setup_logging():
+    """werkzeug/request logs + app stdout into a size-capped rotating file."""
+    handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=cfg("log.max_bytes", 2_000_000),
+        backupCount=cfg("log.backups", 3), encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    logging.getLogger("werkzeug").addHandler(handler)
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+
+def _backup_db_now() -> str:
+    """Plain file copy of attendance.db (WAL-safe: copy -wal/-shm too)."""
+    bdir = DATA_DIR / "backups"
+    bdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = bdir / f"attendance_{stamp}.db"
+    shutil.copy2(DB_FILE, dest)
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(DB_FILE) + suffix)
+        if side.exists():
+            shutil.copy2(side, Path(str(dest) + suffix))
+    # retention: newest backup.keep files win
+    backups = sorted(bdir.glob("attendance_*.db"), reverse=True)
+    for old in backups[cfg("backup.keep", 10):]:
+        for p in (old, Path(str(old) + "-wal"), Path(str(old) + "-shm")):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return str(dest)
+
+
+def _backup_loop():
+    while True:
+        time.sleep(cfg("backup.interval_hours", 6) * 3600)
+        try:
+            dest = _backup_db_now()
+            _connection_log("server", "db-backup", dest, ok=True, source="system")
+        except Exception as e:
+            _connection_log("server", "db-backup", f"{type(e).__name__}: {e}",
+                            ok=False, source="system")
+
+
+def _graceful_shutdown(signum, frame):
+    """Stop background workers so device locks and DB handles release.
+    Daemon threads die with the process; this just avoids cutting a device
+    session or a SQLite write mid-flight."""
+    try:
+        SYNC_STATE["stop"] = True
+        SYNC_STATE["cancel_requested"] = True
+        _SYNC_QUEUE.put([])         # unblock the worker, it exits via stop
+    except Exception:
+        pass
+    # Second signal = user really wants out, right now.
+    signal.signal(signal.SIGINT if signum == signal.SIGINT else signal.SIGTERM,
+                  signal.SIG_DFL)
+
+
 if __name__ == "__main__":
     db_init()
+    _setup_logging()
     start_background_workers()
+    threading.Thread(target=_backup_loop, daemon=True,
+                     name="db-backup").start()
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    atexit.register(lambda: _backup_db_now() if DB_FILE.exists() else None)
     print("* Attendance manager  ->  http://0.0.0.0:%d" % PORT_WEB)
     print("* SQLite archive      ->  %s" % DB_FILE)
     print("* ADMS push listener  ->  port %d (/iclock)" % ADMS_PORT)
     print("* devices registry    ->  %s" % DEVICES_FILE)
-    app.run(host=HOST, port=PORT_WEB, debug=False, threaded=True)
+    print("* server              ->  waitress, %d threads" % WEB_THREADS)
+    from waitress import serve
+    serve(app, host=HOST, port=PORT_WEB, threads=WEB_THREADS,
+          connection_limit=100, channel_timeout=120,
+          # long device pulls stream slowly — give generous window sizes
+          recv_bytes=65536, send_bytes=65536)

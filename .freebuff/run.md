@@ -5,7 +5,7 @@
 Single-file Python app (`app.py`); no build step, no Node, no env files.
 
 ```bash
-pip install flask pyzk openpyxl
+pip install flask pyzk openpyxl waitress
 ```
 
 Data files, all auto-created on first run:
@@ -32,15 +32,56 @@ powershell -NoProfile -Command "(Start-Process -FilePath 'python.exe' -ArgumentL
   `ADMS_PORT`). Point a device's "Cloud Server / ADMS" address at
   `<host>:8081`; its serial then appears in the approval queue
   (Sync tab) and must be approved once before events are stored.
-- On boot two daemon threads start: the auto-sync poller (default every
-  900 s, toggleable in the UI / `POST /api/sync/settings`) and the ADMS
-  listener. `python app.py` is all that is needed.
+- On boot the daemon threads start: the auto-sync poller (default every
+  900 s, toggleable in the UI / `POST /api/sync/settings`), the ADMS
+  listener, and a 6-hourly `data/backups/attendance_<stamp>.db` copier
+  (keeps the 10 newest; also one backup on graceful shutdown). Auto-sync,
+  manual `POST /api/sync` and revival-watch syncs all funnel through ONE
+  queued worker thread (`_sync_queue_job`), so passes never interleave.
+- The web server is **waitress** (16 threads, `WEB_THREADS` env override,
+  connection_limit=100) — not Flask's dev server. SIGINT/SIGTERM set
+  `SYNC_STATE.stop` and drain gracefully; a second Ctrl+C force-kills.
+- Logs: `attendance.log` (rotating, 2 MB × 3) via RotatingFileHandler.
+- Read endpoints are TTL-cached in-process (dict+lock, no Redis):
+  /api/devices 5 s, /api/scan 10 s (live while scanning),
+  /api/connection-logs 5 s, /api/archive 30 s, /api/sync 2 s — every
+  write path (registry changes, attendance/employee inserts, sync finish,
+  connection-log entries) calls `cache_invalidate`, so state changes are
+  visible immediately.
+- Per-device lock waits: green-label pulls default 45 s (`lock_timeout`
+  per device to override), FK fetches 8 s, set-time 10 s — instead of a
+  fixed 30 s for everything. `python app.py` is all that is needed.
+
+## Runtime settings (تنظیمات tab) — data/settings.json
+
+All formerly hardcoded numbers are live-editable from the UI's «تنظیمات» tab
+(and stored in `data/settings.json`, auto-created on first save). Precedence
+for every knob: **settings.json > env var (`HOZOR_<KEY>`, e.g.
+`HOZOR_CACHE_TTL_DEVICES`) > built-in default**. `cfg("dotted.key", default)`
+is the single accessor; POST applies instantly (except `web.threads`, which
+waitress binds at boot). Sections: cache TTLs (devices 5 s / scan 10 s /
+connection-logs 5 s / archive 30 s / sync 2 s), lock timeouts (ZK 45 s /
+FK 8 s / set-time 10 s), auto-sync interval (900 s), backup interval/keep
+(6 h / 10), log rotation (2 MB × 3), web threads (16), and the browser
+polling rates (`ui_polling.*`) that the page re-reads after each save.
+New endpoints: `GET /api/settings` (settings + defaults + backup dir),
+`POST /api/settings` (whitelisted numeric keys with min/max validation;
+unknown keys → 400). Tests: `.tmp/test_settings.py` (23 checks).
+
+## Cross-platform
+
+- `start.sh` (Linux/macOS): `./start.sh start|stop|status` — nohup-detached,
+  logs to `logs/server.log` / `logs/server.err.log`, refuses double-start.
+  Windows keeps `start.bat` / `stop.bat`.
+- All paths are `pathlib`-based off `BASE_DIR`; no win32-only imports.
+- UI is responsive (breakpoints 1024/768/480 px: hamburger nav, stacked
+  rows, 44 px touch targets, ≥14 px font, horizontally scrollable tables);
 
 ## Ports used
 
 | Port | Purpose |
 |---|---|
-| 5000 | Web UI + REST API |
+| 5000 | Web UI + REST API (waitress, 16 threads) |
 | 8081 | ADMS device push (`/iclock/cdata?SN=...`) |
 
 ADMS/PUSH protocol (ported from zkteco_sync): handshake `/iclock/cdata` (GET,
@@ -104,6 +145,14 @@ body restarts some firmwares' push setup).
 - `PATCH /api/devices/<ip>` edits label/location/enabled of a registered
   device without deleting it (e.g. to re-pin the WL50 label after an
   identify that overwrites it with the platform name).
+- 2026-09-15: 172.16.50.30 (WL50) came back on 4370 and its FIRST live pull
+  succeeded: 26,970 raw records read from the device → 26,830 unique after
+  dedupe, byte-identical to the SQLite archive (device clock drifts ~20 s).
+  Lesson: a full green-label pull can hold the per-device lock for minutes;
+  concurrent `/api/logs` calls then fail with "device busy (lock timeout
+  after 30s)" and fall back to the archive — wait for `/api/sync` running
+  to flip false, or trigger `POST /api/sync {"device": "<ip>"}` and watch
+  `/api/fetch-progress`.
 - FK/B-series devices (Faratechno AI09F-class face units, e.g. 172.16.8.20)
   do NOT speak ZK/4370. The vendor suite (`faratecno/`, "محاسبه کارکرد" by
   Latifi) talks to them with the FKAttend/FKViaDev protocol on **TCP 5005**
