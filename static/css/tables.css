@@ -1,0 +1,95 @@
+/* ============================================================
+   tables.css — data tables (sort, scroll-fade, mobile cards)
+   ============================================================ */
+.table-wrap { position: relative; overflow: auto; }
+
+/* edge fade: RTL overflow continues at the LEFT edge; appears via
+   .has-hscroll when the table really overflows (ui.js marks it) */
+.table-wrap::after {
+  content: '';
+  position: absolute; top: 0; bottom: 0; left: 0; width: 26px;
+  pointer-events: none; opacity: 0;
+  transition: opacity var(--transition-slow);
+  background: linear-gradient(to left, var(--color-surface), transparent);
+}
+.table-wrap.has-hscroll::after { opacity: 1; }
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .9em;
+}
+table.data th {
+  text-align: right;
+  color: var(--color-text-muted);
+  font-weight: 600; font-size: .88em;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 2px solid var(--color-border);
+  white-space: nowrap;
+  position: sticky; top: 0;
+  background: var(--color-surface);
+  z-index: 2;
+}
+table.data th.sortable { cursor: pointer; user-select: none; }
+table.data th.sortable:hover { color: var(--color-accent); }
+table.data th .sort-ind { opacity: .35; font-size: .8em; margin-inline-start: 2px; }
+table.data th[aria-sort] { color: var(--color-accent); }
+table.data th[aria-sort] .sort-ind { opacity: 1; }
+
+table.data td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 55%, transparent);
+  vertical-align: middle;
+}
+table.data tbody tr { transition: background var(--transition); }
+table.data tbody tr:hover { background: color-mix(in srgb, var(--color-accent) 6%, transparent); }
+table.data td.num, table.data th.num { text-align: center; }
+
+/* mobile: rows become cards */
+@media (max-width: 768px) {
+  table.data, table.data tbody, table.data tr, table.data td { display: block; }
+  table.data thead { display: none; }
+  table.data tr {
+    background: color-mix(in srgb, var(--color-surface-2) 55%, transparent);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: var(--space-2) var(--space-3);
+    margin-bottom: var(--space-2);
+  }
+  table.data td {
+    display: flex; justify-content: space-between; align-items: center; gap: var(--space-3);
+    border-bottom: 1px dashed color-mix(in srgb, var(--color-border) 45%, transparent);
+    padding: var(--space-2) 0;
+    min-height: 36px;
+  }
+  table.data td:last-child { border-bottom: none; }
+  table.data td::before {
+    content: attr(data-label);
+    color: var(--color-text-muted);
+    font-size: .8em; font-weight: 600;
+    flex-shrink: 0;
+  }
+  table.data td:empty::before, table.data td.col-actions::before { content: none; }
+}
+
+/* pagination bar */
+.table-pager {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-3) var(--space-2) 0;
+  color: var(--color-text-muted); font-size: .85em;
+  flex-wrap: wrap;
+}
+.table-pager .pages { display: flex; gap: var(--space-1); }
+.table-pager button {
+  min-width: 34px; min-height: 34px;
+  border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+  background: transparent; color: var(--color-text-muted);
+  font: inherit; font-size: .85em; cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+.table-pager button:hover:not(:disabled) { border-color: var(--color-accent); color: var(--color-accent); }
+.table-pager button[aria-current="page"] {
+  background: var(--color-accent); color: var(--color-accent-contrast);
+  border-color: var(--color-accent); font-weight: 600;
+}
+.table-pager button:disabled { opacity: .35; cursor: not-allowed; }

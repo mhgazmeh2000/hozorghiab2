@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>سامانه حضور و غیاب</title>
+<link rel="stylesheet" href="/static/css/fonts.css">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<link rel="stylesheet" href="/static/css/components.css">
+<link rel="stylesheet" href="/static/css/tables.css">
+<link rel="stylesheet" href="/static/css/responsive.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<!-- icon sprite (inline copy so it works offline even over file://) -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="i-dash" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" d="M3 13h8V3H3v10zm0 8h8v-5H3v5zm10 0h8V11h-8v10zm0-18v5h8V3h-8z"/></symbol>
+  <symbol id="i-dev" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="10" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 17.5h6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M2.8 20c.7-3.4 3.2-5.2 6.2-5.2s5.5 1.8 6.2 5.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="17" cy="9" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M16.4 14.6c2.7.2 4.4 1.8 4.9 4.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+  <symbol id="i-log" viewBox="0 0 24 24"><path d="M4 5h16M4 10h16M4 15h10M4 20h7" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-arch" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-sync" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M18 2v4h-4M6 22v-4h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-conn" viewBox="0 0 24 24"><path d="M7 12a5 5 0 0 1 10 0M4 9a9 9 0 0 1 16 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="18.5" r="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M3 7V4.5A1.5 1.5 0 0 1 4.5 3H7M17 3h2.5A1.5 1.5 0 0 1 21 4.5V7M21 17v2.5a1.5 1.5 0 0 1-1.5 1.5H17M7 21H4.5A1.5 1.5 0 0 1 3 19.5V17M3 12h18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-set" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v3M12 18.2v3M21.2 12h-3M5.8 12h-3M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1M18.5 18.5l-2.1-2.1M7.6 7.6 5.5 5.5" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2.2M12 19.3v2.2M21.5 12h-2.2M4.7 12H2.5M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6M18.7 18.7l-1.6-1.6M6.9 6.9 5.3 5.3" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 1 1 9.5 3.5a7 7 0 0 0 11 11z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M18 2v4h-4M6 22v-4h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round"/></symbol>
+  <symbol id="i-empty" viewBox="0 0 24 24"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h4l2 2.5h7A2.5 2.5 0 0 1 21 9v9.5A2.5 2.5 0 0 1 18.5 21h-13A2.5 2.5 0 0 1 3 18.5v-12z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 10.5h18" stroke="currentColor" stroke-width="1.6"/></symbol>
+</svg>
+
+<a class="skip-link" href="#main">پرش به محتوا</a>
+
+<header class="app-header">
+  <button id="nav-btn" aria-label="باز و بسته کردن منو" aria-expanded="false" aria-controls="main-nav">
+    <svg aria-hidden="true" width="20" height="20"><use href="#i-menu"></use></svg>
+  </button>
+  <h1>🖥 سامانه حضور و غیاب</h1>
+  <span class="badge" id="clock" aria-label="زمان فعلی"></span>
+  <span class="spacer"></span>
+  <button class="btn icon ghost" id="theme-btn" aria-label="تغییر تم روشن/تیره" data-tip="تغییر تم"></button>
+  <button class="btn danger" id="stop-sync-btn" hidden>توقف همگام‌سازی</button>
+  <button class="btn primary" id="checkall-btn">بررسی اتصال همه</button>
+  <button class="btn icon" id="reload-btn" aria-label="بازخوانی" data-tip="بازخوانی">
+    <svg aria-hidden="true" width="16" height="16"><use href="#i-refresh"></use></svg>
+  </button>
+</header>
+
+<nav class="nav-tabs" id="main-nav" role="tablist" aria-label="بخش‌های سامانه">
+  <button role="tab" data-route="dash"  aria-selected="true"><svg width="16" height="16" aria-hidden="true"><use href="#i-dash"></use></svg>داشبورد</button>
+  <button role="tab" data-route="devs"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-dev"></use></svg>دستگاه‌ها</button>
+  <button role="tab" data-route="users" aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-users"></use></svg>کاربران</button>
+  <button role="tab" data-route="logs"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-log"></use></svg>ترددها</button>
+  <button role="tab" data-route="arch"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-arch"></use></svg>بایگانی</button>
+  <button role="tab" data-route="sync"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-sync"></use></svg>همگام‌سازی</button>
+  <button role="tab" data-route="conn"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-conn"></use></svg>لاگ ارتباط</button>
+  <button role="tab" data-route="scan"  aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-scan"></use></svg>اسکن شبکه</button>
+  <button role="tab" data-route="settings" aria-selected="false"><svg width="16" height="16" aria-hidden="true"><use href="#i-set"></use></svg>تنظیمات</button>
+</nav>
+
+<main class="container" id="main">
+  <!-- ===== DASHBOARD ===== -->
+  <section class="tab-panel active" id="t-dash" role="tabpanel" aria-label="داشبورد">
+    <div class="kpi-grid" id="kpis" aria-live="polite"></div>
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-dev"></use></svg>
+        وضعیت سریع دستگاه‌ها
+      </div>
+      <div class="card-body" id="dash-tbl-host"></div>
+    </div>
+  </section>
+
+  <!-- ===== DEVICES ===== -->
+  <section class="tab-panel" id="t-devs" role="tabpanel" aria-label="دستگاه‌ها">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-dev"></use></svg>
+        دستگاه‌های ثبت‌شده
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn small primary" id="add-dev-btn">
+          <svg width="14" height="14" aria-hidden="true"><use href="#i-plus"></use></svg>
+          افزودن دستگاه
+        </button>
+      </div>
+      <div class="card-body" id="dev-table-host"></div>
+    </div>
+  </section>
+
+  <!-- ===== PHASE 2/3 PLACEHOLDERS ===== -->
+  <section class="tab-panel" id="t-users" role="tabpanel" aria-label="کاربران">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-users"></use></svg>
+        مدیریت کاربران
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <label class="field"><span>دستگاه</span><select id="u-dev"></select></label>
+          <label class="field"><span>فیلتر دستگاه</span><input id="u-filter" placeholder="IP یا مدل" style="direction:ltr"></label>
+          <label class="field"><span>شناسه کاربر</span><input id="u-id" style="direction:ltr"></label>
+          <label class="field"><span>UID عددی</span><input id="u-uid" style="direction:ltr"></label>
+          <label class="field"><span>نام و نام خانوادگی</span><input id="u-name"></label>
+          <label class="field"><span>شماره کارت (اختیاری)</span><input id="u-card" style="direction:ltr"></label>
+          <div class="field"><span>&nbsp;</span><button class="btn primary" id="create-user-btn">ساخت کاربر روی دستگاه</button></div>
+        </div>
+        <div class="form-row" style="margin-top:var(--space-3)">
+          <label class="field"><span>دستگاه مبدأ برای کپی اثر انگشت (اختیاری)</span><select id="u-src"></select></label>
+          <div class="field" style="flex:2"><span>&nbsp;</span>
+            <div class="muted" style="font-size:.85em">دستگاه‌های Green Label (مثل WL50) ثبت تعاملی با حسگر را از راه دور قبول نمی‌کنند؛ اثر انگشت را روی دستگاه مبدأ ثبت کنید تا کپی شود.</div>
+          </div>
+        </div>
+        <div class="muted" id="u-sum" style="margin-top:var(--space-3);font-size:.9em" aria-live="polite"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="users-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-logs" role="tabpanel" aria-label="ترددها">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-log"></use></svg>
+        استعلام ترددها
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <label class="field"><span>دستگاه</span><select id="q-dev"></select></label>
+          <label class="field"><span>از تاریخ</span><input type="date" id="q-from" style="direction:ltr"></label>
+          <label class="field"><span>تا تاریخ</span><input type="date" id="q-to" style="direction:ltr"></label>
+          <label class="field" style="max-width:110px"><span>تایم‌اوت (ثانیه)</span><input id="q-timeout" placeholder="10" style="direction:ltr"></label>
+        </div>
+        <div class="form-row" style="margin-top:var(--space-3)">
+          <button class="btn primary" id="fetch-logs-btn">دریافت زنده</button>
+          <button class="btn" id="fetch-new-btn">فقط رکوردهای جدید</button>
+          <button class="btn" id="logs-arch-btn">از بایگانی</button>
+          <span style="flex:1"></span>
+          <button class="btn" id="export-csv-btn" data-tip="خروجی CSV">CSV</button>
+          <button class="btn" id="export-xlsx-btn" data-tip="خروجی Excel">Excel</button>
+        </div>
+        <div class="progress" style="margin-top:var(--space-3)"><i id="log-prog-bar"></i></div>
+        <div class="muted" id="log-sum" style="margin-top:var(--space-2);font-size:.9em" aria-live="polite"></div>
+        <div class="muted mono" id="fetch-prog" style="margin-top:var(--space-2);font-size:.82em;white-space:pre-wrap;direction:ltr;text-align:left"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="log-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-arch" role="tabpanel" aria-label="بایگانی">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-arch"></use></svg>
+        بایگانی ترددها
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <label class="field"><span>دستگاه</span><select id="a-dev"></select></label>
+          <label class="field"><span>از تاریخ</span><input type="date" id="a-from" style="direction:ltr"></label>
+          <label class="field"><span>تا تاریخ</span><input type="date" id="a-to" style="direction:ltr"></label>
+          <label class="field" style="flex:2"><span>جستجو (نام/شناسه)</span><input id="a-q" placeholder="مثلاً ali یا 1024"></label>
+          <div class="field"><span>&nbsp;</span><button class="btn primary" id="arch-search-btn">نمایش</button></div>
+        </div>
+        <div class="muted" id="a-sum" style="margin-top:var(--space-3);font-size:.9em" aria-live="polite"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="arch-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-sync" role="tabpanel" aria-label="همگام‌سازی">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-sync"></use></svg>
+        وضعیت همگام‌سازی خودکار
+        <span class="spacer" style="flex:1"></span>
+        <span class="badge" id="sy-db-total"></span>
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <div class="field"><span>وضعیت</span>
+            <div id="sy-auto-state" style="min-height:40px;display:flex;align-items:center;gap:6px;padding:0 var(--space-2)"></div>
+          </div>
+          <label class="field" style="max-width:170px"><span>فاصله (دقیقه)</span>
+            <input id="sy-interval" type="number" min="1" max="1440" step="1" value="15" style="direction:ltr">
+          </label>
+          <div class="field"><span>&nbsp;</span><button class="btn primary" id="sy-auto-save">ذخیرهٔ تنظیم خودکار</button></div>
+          <span style="flex:1"></span>
+          <div class="field"><span>&nbsp;</span><button class="btn" id="sy-refresh-btn">بروزرسانی</button></div>
+        </div>
+        <div class="muted mono" id="sy-prog" style="margin-top:var(--space-2);font-size:.82em;white-space:pre-wrap;direction:ltr;text-align:left"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-sync"></use></svg>
+        اجرای دستی
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <button class="btn primary" id="sy-all-btn">همگام‌سازی همه دستگاه‌ها</button>
+          <label class="field" style="max-width:260px"><span>یک دستگاه</span><select id="sy-one-dev"></select></label>
+          <div class="field"><span>&nbsp;</span><button class="btn" id="sy-one-btn">همگام‌سازی همین</button></div>
+        </div>
+        <div class="progress" style="margin-top:var(--space-3)"><i id="sy-prog-bar"></i></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-conn"></use></svg>
+        ADMS (پیش‌رانش دستگاه‌ها)
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <div class="field"><span>پورت شنونده</span><div class="badge" id="adms-port">—</div></div>
+          <div class="field"><span>رویدادهای دریافتی</span><div class="badge" id="adms-events">—</div></div>
+          <div class="field" style="flex:2"><span>آخرین رویداد</span><div class="muted" id="adms-last">—</div></div>
+        </div>
+        <div class="form-row" style="margin-top:var(--space-3)">
+          <label class="field" style="max-width:260px"><span>دستگاه</span><select id="sy-adms-dev"></select></label>
+          <div class="field"><span>&nbsp;</span><button class="btn" id="adms-q-user">استعلام کاربران (ADMS)</button></div>
+          <div class="field"><span>&nbsp;</span><button class="btn" id="adms-q-attlog">استعلام ترددها (ADMS)</button></div>
+        </div>
+        <div class="form-row" style="margin-top:var(--space-3)">
+          <div class="field" style="flex:1"><span>در انتظار تأیید</span><div id="adms-pending"></div></div>
+          <div class="field" style="flex:1"><span>تأییدشده</span><div id="adms-approved"></div></div>
+        </div>
+        <div class="muted mono" id="adms-log" style="margin-top:var(--space-2);font-size:.78em;white-space:pre-wrap;direction:ltr;text-align:left;max-height:120px;overflow:auto"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="sy-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-conn" role="tabpanel" aria-label="لاگ ارتباط">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-conn"></use></svg>
+        لاگ ارتباط دستگاه‌ها
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn small" id="cn-clear-btn">پاک‌کردن نمایش</button>
+        <button class="btn small primary" id="cn-refresh-btn">بروزرسانی</button>
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <label class="field" style="max-width:220px"><span>دستگاه</span><select id="cn-dev"></select></label>
+          <label class="field" style="max-width:220px"><span>نوع رویداد</span><select id="cn-event"></select></label>
+          <div class="field" style="flex:1"><span>&nbsp;</span><div class="muted" id="cn-sum" aria-live="polite" style="min-height:40px;display:flex;align-items:center"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="cn-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-scan" role="tabpanel" aria-label="اسکن شبکه">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-scan"></use></svg>
+        اسکن شبکه
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <label class="field" style="flex:2"><span>سابنت‌ها (هر خط یک رنج)</span>
+            <textarea id="sc-subnets" rows="3" style="direction:ltr" placeholder="172.16.50.0/24"></textarea>
+          </label>
+          <label class="field" style="max-width:130px"><span>تایم‌اوت (ثانیه)</span>
+            <input id="sc-timeout" type="number" min="0.1" max="5" step="0.1" value="0.6" style="direction:ltr">
+          </label>
+          <label class="field" style="max-width:150px"><span>&nbsp;</span>
+            <label style="display:flex;align-items:center;gap:6px;min-height:40px"><input type="checkbox" id="sc-deep" checked style="min-height:auto;width:auto">شناسایی عمیق</label>
+          </label>
+          <div class="field"><span>&nbsp;</span><button class="btn primary" id="sc-start-btn">شروع اسکن</button></div>
+        </div>
+        <div class="progress" style="margin-top:var(--space-3)"><i id="sc-bar"></i></div>
+        <div class="muted" id="sc-progress" style="margin-top:var(--space-2);font-size:.88em" aria-live="polite"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-body" id="sc-table-host"></div></div>
+  </section>
+  <section class="tab-panel" id="t-settings" role="tabpanel" aria-label="تنظیمات">
+    <div class="card">
+      <div class="card-header">
+        <svg width="16" height="16" aria-hidden="true"><use href="#i-set"></use></svg>
+        تنظیمات سیستم
+      </div>
+      <div class="card-body">
+        <div class="form-row">
+          <div class="field" style="flex:1"><span>مسیر پشتیبان‌ها (فقط-خواندنی)</span>
+            <div class="muted mono ltr" id="st-backup-dir">—</div>
+          </div>
+        </div>
+        <div class="muted" id="st-env" style="font-size:.82em;margin-top:var(--space-2)"></div>
+      </div>
+    </div>
+    <div id="st-sections"></div>
+  </section>
+</main>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

@@ -19,6 +19,37 @@ Data files, all auto-created on first run:
   for the green-label WiFi units (used as fallback when the device is in its
   post-session cooldown).
 
+## UI (phase-1 rewrite — static/, vanilla, offline)
+
+`/` serves `static/index.html` (modern UI); `/legacy` serves the old inline
+page (HTML_PAGE is kept untouched as fallback — if static/index.html is
+deleted, `/` automatically serves the legacy page again).
+
+- `static/fonts/` — Vazirmatn woff2 x4 weights, self-hosted; `fonts.css`
+  declares only weights present (missing -> system-ui/Tahoma fallback).
+- `static/css/` — tokens (dark+light, `:root[data-theme]`, auto prefers-color-
+  scheme), base (reset, clamp() type, focus-visible, themed scrollbars hidden
+  <=768px, reduced-motion), layout (sticky header, nav tabs + hamburger),
+  components (card/button/field/badge/toast/modal w/ focus-trap/dropdown/
+  skeleton/empty/spinner/tooltip/progress), tables (sticky head, sortable,
+  edge fade, mobile card rows), responsive (320/375/768/1024/1440).
+- `static/js/` — api.js (AbortController timeouts, Persian errors), ui.js
+  (toast/confirm/modal/tabs keyboard/dropdown/debounce/Intl fa-IR/theme
+  toggle->localStorage/skeleton/empty), table.js (generic sort + debounced
+  filter + pagination + mobile cards), devices.js (dash KPIs + devices table,
+  optimistic delete w/ confirm), placeholders.js (phase-2 tabs notice),
+  app.js (hash routing w/ back/forward, theme, schedulers reading ui_polling).
+- Zero external requests (verified: all network calls hit 127.0.0.1).
+- Phase 2 tabs (کاربران users / ترددها logs / بایگانی archive) are ported
+  into the shell: `users.js` (device filter, create user, enroll incl.
+  green-label template copy + polling), `logs.js` (live/new/archive fetch,
+  dynamic progress polling, adjustable timeout, CSV/Excel export),
+  `archive.js` (search + totals + source badges). They are initialized in
+  `app.js` via `initUsersPage()/initLogsPage()/initArchivePage()` (imported
+  next to `initDevicesPage()` — if a tab's controls don't respond, check
+  these init calls first). `placeholders.js` covers only the remaining
+  phase-3 tabs (sync/conn/scan/settings); /legacy still has the full old UI.
+
 ## Run server
 
 ```powershell
@@ -42,6 +73,8 @@ powershell -NoProfile -Command "(Start-Process -FilePath 'python.exe' -ArgumentL
   connection_limit=100) — not Flask's dev server. SIGINT/SIGTERM set
   `SYNC_STATE.stop` and drain gracefully; a second Ctrl+C force-kills.
 - Logs: `attendance.log` (rotating, 2 MB × 3) via RotatingFileHandler.
+- `/static` is served with **no browser caching** (`SEND_FILE_MAX_AGE_DEFAULT = 0`) so
+  JS/CSS edits reach clients on reload without hard-refresh (LAN app, tiny files).
 - Read endpoints are TTL-cached in-process (dict+lock, no Redis):
   /api/devices 5 s, /api/scan 10 s (live while scanning),
   /api/connection-logs 5 s, /api/archive 30 s, /api/sync 2 s — every
@@ -51,6 +84,10 @@ powershell -NoProfile -Command "(Start-Process -FilePath 'python.exe' -ArgumentL
 - Per-device lock waits: green-label pulls default 45 s (`lock_timeout`
   per device to override), FK fetches 8 s, set-time 10 s — instead of a
   fixed 30 s for everything. `python app.py` is all that is needed.
+- ADMS re-pin address: the revival watcher writes the device's push-server
+  address using the local IP that routes TO THE DEVICE (UDP connect
+  `getsockname()`), never `gethostbyname(hostname)` — that resolved to
+  0.0.0.0 on this host once and silently deafened both WL50 units.
 
 ## Runtime settings (تنظیمات tab) — data/settings.json
 

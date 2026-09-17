@@ -1,0 +1,50 @@
+/* ============================================================
+   responsive.css — breakpoints, touch targets, mobile polish
+   ============================================================ */
+
+/* ---------- ≤1024px ---------- */
+@media (max-width: 1024px) {
+  .container { padding: var(--space-3); }
+  #toasts { max-width: min(320px, calc(100vw - var(--space-6))); }
+}
+
+/* ---------- ≤768px (tablet/phone) ---------- */
+@media (max-width: 768px) {
+  /* hide scrollbars visually; scrolling still works */
+  ::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  * { scrollbar-width: none; -ms-overflow-style: none; }
+
+  .form-row { flex-direction: column; align-items: stretch; }
+  .form-row > .field { min-width: 0; width: 100%; }
+
+  .card { border-radius: var(--radius-md); margin-bottom: var(--space-3); }
+  .card-body { padding: var(--space-3); }
+
+  .actions .btn { min-height: 44px; padding-inline: var(--space-3); }
+  .btn { min-height: 44px; }
+
+  .kpi { padding: var(--space-3); }
+}
+
+/* ---------- ≤480px (phone) ---------- */
+@media (max-width: 480px) {
+  body { font-size: 14px; }
+  .app-header h1 { font-size: 14px; }
+  .actions { gap: var(--space-2); }
+  .actions .btn { flex: 1 1 auto; }
+  table.data td, table.data td::before { font-size: .92em; }
+  dialog.modal > .modal-body { padding: var(--space-3); }
+}
+
+/* ---------- ≥1440px (wide desktop) ---------- */
+@media (min-width: 1440px) {
+  .container { max-width: 1400px; }
+  .kpi-grid { gap: var(--space-4); }
+}
+
+/* ---------- ≤320px (tiny) ---------- */
+@media (max-width: 320px) {
+  .app-header { gap: var(--space-2); }
+  .app-header .btn { padding-inline: var(--space-2); }
+  .nav-tabs button { padding-inline: var(--space-3); }
+}

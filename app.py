@@ -33,7 +33,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import calendar
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_from_directory
 from struct import pack, unpack, unpack_from
 
 try:
@@ -1433,7 +1433,15 @@ def _revival_watch_loop():
             # re-pin it to THIS server so its punches land in our archive.
             try:
                 import socket as _s
-                lan_ip = _s.gethostbyname(_s.gethostname())
+                _sd = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+                try:
+                    # The address the OS would use to reach THIS device —
+                    # never 0.0.0.0 (gethostbyname(hostname) can resolve
+                    # to it on machines with no direct LAN A-record).
+                    _sd.connect((ip, int(d.get("port", 4370))))
+                    lan_ip = _sd.getsockname()[0]
+                finally:
+                    _sd.close()
                 c2 = ZK(ip, port=int(d.get("port", 4370)), timeout=20,
                         password=int(d.get("password", 0)),
                         ommit_ping=True).connect()
@@ -2102,11 +2110,23 @@ def _scan_worker(subnets: list, timeout: float, deep: bool):
 # ----------------------------------------------------------------------------
 # Flask app
 # ----------------------------------------------------------------------------
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # LAN app: always revalidate JS/CSS edits
+
+
+NEW_INDEX = BASE_DIR / "static" / "index.html"
 
 
 @app.get("/")
 def index():
+    """Modern UI (static/index.html) when present; legacy inline page otherwise."""
+    if NEW_INDEX.exists():
+        return send_from_directory(NEW_INDEX.parent, NEW_INDEX.name)
+    return Response(HTML_PAGE, mimetype="text/html")
+
+
+@app.get("/legacy")
+def legacy_index():
     return Response(HTML_PAGE, mimetype="text/html")
 
 

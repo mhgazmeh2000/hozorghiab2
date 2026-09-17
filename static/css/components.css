@@ -1,0 +1,250 @@
+/* ============================================================
+   components.css — vanilla design-system components
+   ============================================================ */
+
+/* ---------- card ---------- */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-4);
+  overflow: clip;
+}
+.card > header, .card-header {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center; gap: var(--space-2);
+  font-weight: 600; color: var(--color-accent);
+}
+.card-body { padding: var(--space-4); }
+.card-footer {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: .9em;
+}
+
+/* ---------- buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  background: var(--color-surface-2); color: var(--color-text);
+  border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-4);
+  min-height: 40px;
+  font: inherit; font-size: .92em; cursor: pointer;
+  transition: background var(--transition), border-color var(--transition),
+              color var(--transition), transform var(--transition);
+}
+.btn:hover { border-color: var(--color-accent); color: var(--color-accent); }
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+.btn.primary {
+  background: var(--color-accent); color: var(--color-accent-contrast);
+  border-color: var(--color-accent); font-weight: 600;
+}
+.btn.primary:hover { background: var(--color-accent-hover); border-color: var(--color-accent-hover); color: var(--color-accent-contrast); }
+.btn.danger {
+  background: color-mix(in srgb, var(--color-danger) 14%, transparent);
+  color: var(--color-danger); border-color: color-mix(in srgb, var(--color-danger) 40%, transparent);
+}
+.btn.danger:hover { background: var(--color-danger-strong); color: #fff; border-color: var(--color-danger-strong); }
+.btn.ghost { background: transparent; border-color: transparent; }
+.btn.ghost:hover { background: var(--color-surface-2); }
+.btn.icon { min-width: 40px; padding: var(--space-2); }
+.btn.small { min-height: 32px; padding: var(--space-1) var(--space-3); font-size: .85em; }
+
+.btn .spinner { display: none; }
+.btn.busy .spinner { display: inline-block; }
+.btn.busy { pointer-events: none; color: var(--color-accent); border-color: var(--color-accent); }
+
+/* ---------- form fields ---------- */
+.field { display: flex; flex-direction: column; gap: var(--space-1); }
+.field > label { color: var(--color-text-muted); font-size: .82em; font-weight: 500; }
+.field .helper { color: var(--color-text-muted); font-size: .78em; }
+.field.invalid input, .field.invalid select, .field.invalid textarea { border-color: var(--color-danger); }
+.field .error { color: var(--color-danger); font-size: .78em; display: none; }
+.field.invalid .error { display: block; }
+
+input, select, textarea {
+  background: color-mix(in srgb, var(--color-bg) 55%, var(--color-surface));
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  min-height: 40px;
+  font: inherit; font-size: .92em;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+input:hover, select:hover, textarea:hover { border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border)); }
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+textarea { min-height: 96px; resize: vertical; }
+input[type="date"] { color-scheme: inherit; }
+
+.form-row {
+  display: flex; gap: var(--space-3); flex-wrap: wrap; align-items: flex-end;
+}
+.form-row > .field { flex: 1; min-width: 150px; }
+
+/* ---------- badge / chip ---------- */
+.badge {
+  display: inline-flex; align-items: center; gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: 999px;
+  font-size: .75em; font-weight: 600;
+  background: var(--color-surface-2); color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.badge.success { color: var(--color-success); border-color: color-mix(in srgb, var(--color-success) 40%, transparent); background: color-mix(in srgb, var(--color-success) 12%, transparent); }
+.badge.danger { color: var(--color-danger); border-color: color-mix(in srgb, var(--color-danger) 40%, transparent); background: color-mix(in srgb, var(--color-danger) 12%, transparent); }
+.badge.warning { color: var(--color-warning); border-color: color-mix(in srgb, var(--color-warning) 40%, transparent); background: color-mix(in srgb, var(--color-warning) 12%, transparent); }
+.badge.accent { color: var(--color-accent); border-color: color-mix(in srgb, var(--color-accent) 40%, transparent); background: color-mix(in srgb, var(--color-accent) 12%, transparent); }
+
+.status-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-inline-end: var(--space-1); vertical-align: middle;
+}
+.status-dot.on { background: var(--color-success); box-shadow: 0 0 6px color-mix(in srgb, var(--color-success) 60%, transparent); }
+.status-dot.off { background: var(--color-danger); }
+
+/* ---------- toasts ---------- */
+#toasts {
+  position: fixed; bottom: var(--space-4); inset-inline-start: var(--space-4);
+  z-index: 120; display: flex; flex-direction: column; gap: var(--space-2);
+  max-width: min(380px, calc(100vw - var(--space-6)));
+}
+.toast {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-3) var(--space-4);
+  display: flex; align-items: center; gap: var(--space-2);
+  animation: toast-in var(--transition-slow) ease;
+}
+.toast.err { border-color: var(--color-danger); }
+.toast.out { opacity: 0; transform: translateY(6px); transition: opacity var(--transition-slow), transform var(--transition-slow); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(10px); } }
+
+/* ---------- modal ---------- */
+dialog.modal {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  color: var(--color-text);
+  box-shadow: var(--shadow-lg);
+  padding: 0;
+  width: min(520px, calc(100vw - var(--space-6)));
+  max-height: min(80dvh, 700px);
+}
+dialog.modal::backdrop { background: rgba(2,8,20,.6); backdrop-filter: blur(2px); }
+dialog.modal > header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  font-weight: 600; color: var(--color-accent);
+}
+dialog.modal > .modal-body { padding: var(--space-4); overflow-y: auto; }
+dialog.modal > footer {
+  display: flex; justify-content: flex-end; gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+@media (max-width: 480px) {
+  dialog.modal { width: 100dvw; max-height: 100dvh; height: 100dvh; border-radius: 0; border: none; }
+}
+
+/* ---------- dropdown ---------- */
+.dropdown { position: relative; display: inline-block; }
+.dropdown-menu {
+  position: absolute; top: calc(100% + 4px); inset-inline-end: 0;
+  min-width: 180px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-1);
+  display: none; z-index: 60;
+}
+.dropdown-menu.open { display: block; }
+.dropdown-menu button {
+  display: flex; width: 100%; align-items: center; gap: var(--space-2);
+  background: none; border: 0; border-radius: var(--radius-sm);
+  color: var(--color-text); font: inherit; font-size: .9em;
+  padding: var(--space-2) var(--space-3); min-height: 38px;
+  cursor: pointer; text-align: start;
+}
+.dropdown-menu button:hover { background: var(--color-surface-2); color: var(--color-accent); }
+
+/* ---------- skeleton loader ---------- */
+.skeleton {
+  border-radius: var(--radius-md);
+  background: linear-gradient(90deg,
+    var(--color-surface-2) 25%,
+    color-mix(in srgb, var(--color-surface-2) 55%, var(--color-border)) 50%,
+    var(--color-surface-2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  min-height: 14px;
+}
+.skeleton.text { height: 14px; margin-bottom: var(--space-2); }
+.skeleton.title { height: 20px; width: 40%; margin-bottom: var(--space-3); }
+.skeleton.row { height: 38px; margin-bottom: var(--space-2); }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+/* ---------- empty state ---------- */
+.empty-state {
+  text-align: center;
+  padding: var(--space-7) var(--space-4);
+  color: var(--color-text-muted);
+}
+.empty-state svg { width: 44px; height: 44px; opacity: .45; margin-bottom: var(--space-3); }
+.empty-state p { margin: 0; }
+
+/* ---------- spinner ---------- */
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid currentColor;
+  border-inline-start-color: transparent;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- tooltip ---------- */
+[data-tip] { position: relative; }
+[data-tip]:hover::after, [data-tip]:focus-visible::after {
+  content: attr(data-tip);
+  position: absolute; bottom: calc(100% + 6px); inset-inline-start: 50%;
+  transform: translateX(50%);
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 3px var(--space-2);
+  font-size: .75em; white-space: nowrap;
+  box-shadow: var(--shadow-md);
+  z-index: 90; pointer-events: none;
+}
+
+/* ---------- progress bar ---------- */
+.progress {
+  height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--color-surface-2);
+}
+.progress > i {
+  display: block; height: 100%; width: 0;
+  background: var(--color-accent);
+  border-radius: inherit;
+  transition: width var(--transition-slow);
+}
+
+/* ---------- actions row ---------- */
+.actions { display: flex; gap: var(--space-1); flex-wrap: wrap; }

@@ -2,6 +2,7 @@
 data/attendance.db
 data/attendance.db-shm
 data/attendance.db-wal
+data/backups/
 data/gl_*.bin
 data/devices.json
 server.log
@@ -11,8 +12,12 @@ logs/
 __pycache__/
 *.pyc
 
-# scratch work
+# scratch work (diagnostics, cloned reference repos, installers)
 .tmp/
 
 # vendor installers (large, not source)
 faratecno/
+
+# raw capture files from device pulls (regenerable)
+*.bin
+gl_logs.json

@@ -1,6 +1,6 @@
 {
   "cache_ttl": {
-    "devices": 5,
+    "devices": 7,
     "scan": 10,
     "connection_logs": 5,
     "archive": 30,

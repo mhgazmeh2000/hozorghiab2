@@ -1,0 +1,102 @@
+/* ============================================================
+   tokens.css — Design system variables (dark default + light)
+   4px spacing grid · 180ms transitions · semantic colors
+   ============================================================ */
+:root {
+  /* colors — dark theme (default) */
+  --color-bg: #0b1220;
+  --color-surface: #16213a;
+  --color-surface-2: #1e2c4a;
+  --color-border: #2b3a5c;
+  --color-text: #e8edf6;
+  --color-text-muted: #93a3bd;
+  --color-accent: #38bdf8;
+  --color-accent-hover: #0ea5e9;
+  --color-accent-contrast: #06283d;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-danger-strong: #dc2626;
+
+  /* radii */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 16px;
+
+  /* spacing — 4px grid */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* shadows — soft, layered */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.25);
+  --shadow-md: 0 4px 14px rgba(0,0,0,.28);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.38);
+
+  /* typography */
+  --font-sans: 'Vazirmatn', system-ui, Tahoma, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+
+  /* motion */
+  --transition: 180ms ease;
+  --transition-slow: 260ms ease;
+
+  /* scrollbars (keeps the approved look; hidden ≤768px in responsive.css) */
+  --scroll-thumb: color-mix(in srgb, var(--color-accent) 45%, transparent);
+  --scroll-thumb-hover: color-mix(in srgb, var(--color-accent) 75%, transparent);
+
+  /* component tokens */
+  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+  color-scheme: dark;
+}
+
+/* light theme — applied via [data-theme="light"] or auto preference */
+[data-theme="light"] {
+  --color-bg: #eef2f8;
+  --color-surface: #ffffff;
+  --color-surface-2: #f2f6fc;
+  --color-border: #d4dcea;
+  --color-text: #17233a;
+  --color-text-muted: #5b6b85;
+  --color-accent: #0284c7;
+  --color-accent-hover: #0369a1;
+  --color-accent-contrast: #ffffff;
+  --color-success: #059669;
+  --color-warning: #b45309;
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --shadow-sm: 0 1px 2px rgba(23,35,58,.08);
+  --shadow-md: 0 4px 14px rgba(23,35,58,.10);
+  --shadow-lg: 0 12px 40px rgba(23,35,58,.16);
+  --focus-ring: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-accent);
+  color-scheme: light;
+}
+
+/* auto light when OS prefers it and user hasn't overridden */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --color-bg: #eef2f8;
+    --color-surface: #ffffff;
+    --color-surface-2: #f2f6fc;
+    --color-border: #d4dcea;
+    --color-text: #17233a;
+    --color-text-muted: #5b6b85;
+    --color-accent: #0284c7;
+    --color-accent-hover: #0369a1;
+    --color-accent-contrast: #ffffff;
+    --color-success: #059669;
+    --color-warning: #b45309;
+    --color-danger: #dc2626;
+    --color-danger-strong: #b91c1c;
+    --shadow-sm: 0 1px 2px rgba(23,35,58,.08);
+    --shadow-md: 0 4px 14px rgba(23,35,58,.10);
+    --shadow-lg: 0 12px 40px rgba(23,35,58,.16);
+    --focus-ring: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-accent);
+    color-scheme: light;
+  }
+}
