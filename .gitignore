@@ -21,3 +21,4 @@ faratecno/
 # raw capture files from device pulls (regenerable)
 *.bin
 gl_logs.json
+.freebuff/preview-*.log*
